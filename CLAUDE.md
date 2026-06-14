@@ -66,5 +66,9 @@ Python 3.11+, type hints throughout.
 
 ## Status
 
-Phase 0–1 in progress: stdlib `.pcap` reader + hand-written Ethernet/IP/TCP/UDP
-parser, validated against a synthetic `sample.pcap` fixture.
+Phases 1–5 complete: parser; columnar store (null bitmaps, dictionary-encoded
+protocol); SQL query engine reusing QueryX's design (lexer → parser → executor,
+column pruning); hash / IP-trie / top-N-heap indexes with an index-aware planner;
+and live capture (bounded ring buffer + producer/consumer threads + scapy
+adapter), verified against real captured traffic. 23 tests pass. Next: Phase 6
+(TCP query server), Phase 7 (benchmarks / README).
