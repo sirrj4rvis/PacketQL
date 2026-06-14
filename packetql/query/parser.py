@@ -1,149 +1,151 @@
-"""Recursive-descent parser → Select AST (same structure as QueryX's parser).
+"""Recursive-descent parser → SelectNode AST.
 
-Grammar (one method per rule; precedence falls out of the layering):
+Grammar (precedence falls out of the rule layering):
 
-    select      ::= "SELECT" select_list "FROM" ident
-                    [ "WHERE" expr ]
-                    [ "ORDER" "BY" order_item { "," order_item } ]
-                    [ "LIMIT" number ]
-    select_list ::= "*" | ident { "," ident }
-    order_item  ::= ident [ "ASC" | "DESC" ]
-    expr        ::= or_expr
-    or_expr     ::= and_expr { "OR" and_expr }
-    and_expr    ::= not_expr { "AND" not_expr }
-    not_expr    ::= "NOT" not_expr | comparison
-    comparison  ::= primary [ ( "=" | "!=" | "<>" | "<" | ">" | "<=" | ">=" ) primary ]
-    primary     ::= "(" expr ")" | number | string | ident
+    select     ::= SELECT select_list FROM ident [WHERE expr]
+                   [ORDER BY ident [ASC|DESC]] [LIMIT integer]
+    expr       ::= or_expr
+    or_expr    ::= and_expr {OR and_expr}
+    and_expr   ::= not_expr {AND not_expr}
+    not_expr   ::= NOT not_expr | comparison
+    comparison ::= primary [ (op | LIKE) primary ]
+    primary    ::= "(" expr ")" | integer | float | string | ident
+
+An IP-string literal compared to an IP column (``src_ip = '192.168.1.1'``) is
+converted to its uint32 form here, before planning — IPs are integers downstream.
 """
 
 from __future__ import annotations
 
-from . import ast
-from .lexer import SQLSyntaxError, TokenType, tokenize
+from packetql.query import ast
+from packetql.query.lexer import SQLSyntaxError, TokenType, tokenize
+from packetql.schema import ip_to_int
 
-_COMPARISONS = {TokenType.EQ, TokenType.NEQ, TokenType.LT, TokenType.GT, TokenType.LTE, TokenType.GTE}
+IP_COLUMNS = {"src_ip", "dst_ip"}
+_COMPARISONS = {"=", "!=", "<", ">", "<=", ">="}
 
 
 class Parser:
     def __init__(self, tokens) -> None:
         self._toks = tokens
-        self._pos = 0
+        self._i = 0
 
-    # -- token helpers ------------------------------------------------------
     def _peek(self):
-        return self._toks[self._pos]
+        return self._toks[self._i]
 
-    def _at(self, tt) -> bool:
-        return self._peek().type == tt
-
-    def _advance(self):
-        tok = self._toks[self._pos]
-        self._pos += 1
+    def _next(self):
+        tok = self._toks[self._i]
+        self._i += 1
         return tok
 
-    def _expect(self, tt):
-        tok = self._peek()
-        if tok.type != tt:
-            raise SQLSyntaxError(f"expected {tt.name}, got {tok.type.name} ({tok.lexeme!r})")
-        return self._advance()
+    def _is_kw(self, kw: str) -> bool:
+        t = self._peek()
+        return t.type == TokenType.KEYWORD and t.lexeme == kw
 
-    # -- grammar ------------------------------------------------------------
-    def parse(self) -> ast.Select:
-        self._expect(TokenType.SELECT)
+    def _expect_kw(self, kw: str):
+        if not self._is_kw(kw):
+            raise SQLSyntaxError(f"expected {kw}, got {self._peek().lexeme!r}")
+        return self._next()
+
+    def _expect(self, tt: TokenType):
+        t = self._peek()
+        if t.type != tt:
+            raise SQLSyntaxError(f"expected {tt.name}, got {t.type.name} {t.lexeme!r}")
+        return self._next()
+
+    def parse(self) -> ast.SelectNode:
+        self._expect_kw("SELECT")
         columns = self._select_list()
-        self._expect(TokenType.FROM)
-        table = self._expect(TokenType.IDENT).lexeme
-        where = None
-        if self._at(TokenType.WHERE):
-            self._advance()
-            where = self._expr()
-        order_by = []
-        if self._at(TokenType.ORDER):
-            self._advance()
-            self._expect(TokenType.BY)
-            order_by = self._order_list()
-        limit = None
-        if self._at(TokenType.LIMIT):
-            self._advance()
-            limit = self._expect(TokenType.NUMBER).value
+        self._expect_kw("FROM")
+        table = self._expect(TokenType.IDENTIFIER).lexeme
+        where = self._expr() if self._consume_kw("WHERE") else None
+        order_by = None
+        if self._consume_kw("ORDER"):
+            self._expect_kw("BY")
+            col = self._expect(TokenType.IDENTIFIER).lexeme
+            descending = False
+            if self._consume_kw("ASC"):
+                descending = False
+            elif self._consume_kw("DESC"):
+                descending = True
+            order_by = ast.OrderBy(col, descending)
+        limit = self._expect(TokenType.INTEGER).value if self._consume_kw("LIMIT") else None
         self._expect(TokenType.EOF)
-        return ast.Select(columns, table, where, order_by, limit)
+        return ast.SelectNode(columns, table, where, order_by, limit)
+
+    def _consume_kw(self, kw: str) -> bool:
+        if self._is_kw(kw):
+            self._next()
+            return True
+        return False
 
     def _select_list(self):
-        if self._at(TokenType.STAR):
-            self._advance()
-            return [ast.Star()]
-        cols = [ast.Column(self._expect(TokenType.IDENT).lexeme)]
-        while self._at(TokenType.COMMA):
-            self._advance()
-            cols.append(ast.Column(self._expect(TokenType.IDENT).lexeme))
+        if self._peek().type == TokenType.STAR:
+            self._next()
+            return ["*"]
+        cols = [self._expect(TokenType.IDENTIFIER).lexeme]
+        while self._peek().type == TokenType.COMMA:
+            self._next()
+            cols.append(self._expect(TokenType.IDENTIFIER).lexeme)
         return cols
-
-    def _order_list(self):
-        items = [self._order_item()]
-        while self._at(TokenType.COMMA):
-            self._advance()
-            items.append(self._order_item())
-        return items
-
-    def _order_item(self):
-        name = self._expect(TokenType.IDENT).lexeme
-        descending = False
-        if self._at(TokenType.ASC):
-            self._advance()
-        elif self._at(TokenType.DESC):
-            self._advance()
-            descending = True
-        return ast.OrderItem(name, descending)
 
     def _expr(self):
         return self._or_expr()
 
     def _or_expr(self):
         node = self._and_expr()
-        while self._at(TokenType.OR):
-            self._advance()
-            node = ast.Or(node, self._and_expr())
+        while self._consume_kw("OR"):
+            node = ast.BinaryOp("OR", node, self._and_expr())
         return node
 
     def _and_expr(self):
         node = self._not_expr()
-        while self._at(TokenType.AND):
-            self._advance()
-            node = ast.And(node, self._not_expr())
+        while self._consume_kw("AND"):
+            node = ast.BinaryOp("AND", node, self._not_expr())
         return node
 
     def _not_expr(self):
-        if self._at(TokenType.NOT):
-            self._advance()
-            return ast.Not(self._not_expr())
+        if self._consume_kw("NOT"):
+            return ast.UnaryOp("NOT", self._not_expr())
         return self._comparison()
 
     def _comparison(self):
         left = self._primary()
-        if self._peek().type in _COMPARISONS:
-            op = self._advance().type
-            return ast.Comparison(op, left, self._primary())
-        if self._at(TokenType.LIKE):
-            self._advance()
-            return ast.Like(left, self._primary())
+        t = self._peek()
+        if t.type == TokenType.OPERATOR:
+            op = self._next().lexeme
+            return ast.BinaryOp(op, *self._ip_fix(left, self._primary()))
+        if t.type == TokenType.KEYWORD and t.lexeme == "LIKE":
+            self._next()
+            return ast.BinaryOp("LIKE", left, self._primary())
         return left
 
+    @staticmethod
+    def _ip_fix(left, right):
+        """Convert an IP-string literal compared to an IP column into uint32."""
+        if isinstance(left, ast.ColumnRef) and left.name in IP_COLUMNS \
+                and isinstance(right, ast.Literal) and isinstance(right.value, str):
+            right = ast.Literal(ip_to_int(right.value))
+        elif isinstance(right, ast.ColumnRef) and right.name in IP_COLUMNS \
+                and isinstance(left, ast.Literal) and isinstance(left.value, str):
+            left = ast.Literal(ip_to_int(left.value))
+        return left, right
+
     def _primary(self):
-        tok = self._peek()
-        if tok.type == TokenType.LPAREN:
-            self._advance()
+        t = self._peek()
+        if t.type == TokenType.LPAREN:
+            self._next()
             node = self._expr()
             self._expect(TokenType.RPAREN)
             return node
-        if tok.type in (TokenType.NUMBER, TokenType.STRING):
-            self._advance()
-            return ast.Literal(tok.value)
-        if tok.type == TokenType.IDENT:
-            self._advance()
-            return ast.Column(tok.lexeme)
-        raise SQLSyntaxError(f"unexpected {tok.type.name} ({tok.lexeme!r})")
+        if t.type in (TokenType.INTEGER, TokenType.FLOAT, TokenType.STRING):
+            self._next()
+            return ast.Literal(t.value)
+        if t.type == TokenType.IDENTIFIER:
+            self._next()
+            return ast.ColumnRef(t.lexeme)
+        raise SQLSyntaxError(f"unexpected {t.type.name} {t.lexeme!r}")
 
 
-def parse(sql: str) -> ast.Select:
+def parse(sql: str) -> ast.SelectNode:
     return Parser(tokenize(sql)).parse()

@@ -1,72 +1,47 @@
-"""AST node types for a PacketQL query. Pure data, like QueryX's AST."""
+"""AST node types for a PacketQL query (pure data)."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
-from .lexer import TokenType
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class Star:
-    """``SELECT *``"""
-
-
-@dataclass(frozen=True)
-class Column:
+class ColumnRef:
     name: str
 
 
 @dataclass(frozen=True)
 class Literal:
-    value: object   # int or str
+    value: object        # int, float, or str (IP-string literals become int in the parser)
 
 
 @dataclass(frozen=True)
-class Comparison:
-    op: TokenType
+class BinaryOp:
+    op: str              # '=','!=','<','>','<=','>=','AND','OR','LIKE'
     left: object
     right: object
 
 
 @dataclass(frozen=True)
-class Like:
-    """``column LIKE 'prefix%'`` — only a trailing ``%`` (prefix match) is supported."""
-    left: object
-    right: object
-
-
-@dataclass(frozen=True)
-class And:
-    left: object
-    right: object
-
-
-@dataclass(frozen=True)
-class Or:
-    left: object
-    right: object
-
-
-@dataclass(frozen=True)
-class Not:
+class UnaryOp:
+    op: str              # 'NOT'
     operand: object
 
 
 @dataclass(frozen=True)
-class OrderItem:
+class OrderBy:
     column: str
     descending: bool = False
 
 
 @dataclass(frozen=True)
-class Select:
-    columns: list           # [Column, ...] or [Star]
+class SelectNode:
+    columns: list        # list[str] of column names, or ["*"]
     table: str
     where: object = None
-    order_by: list = field(default_factory=list)   # [OrderItem, ...]
-    limit: object = None    # int or None
+    order_by: object = None     # OrderBy | None
+    limit: object = None        # int | None
 
     @property
     def star(self) -> bool:
-        return len(self.columns) == 1 and isinstance(self.columns[0], Star)
+        return self.columns == ["*"]

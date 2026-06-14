@@ -35,6 +35,7 @@ COLUMNS = [
     ("ttl", "ttl", "<B", 1),
 ]
 COLUMN_NAMES = [name for name, *_ in COLUMNS]
+WIDTHS = {name: width for name, _attr, _fmt, width in COLUMNS}
 _BY_NAME = {name: (attr, fmt, width) for name, attr, fmt, width in COLUMNS}
 
 
