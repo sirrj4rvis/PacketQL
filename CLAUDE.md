@@ -66,9 +66,8 @@ Python 3.11+, type hints throughout.
 
 ## Status
 
-Phases 1–6 complete: parser; columnar store; SQL query engine reusing QueryX's
-design; hash / IP-trie / top-N-heap indexes with an index-aware planner; live
-capture (ring buffer + producer/consumer threads + scapy adapter); and a
-thread-pool TCP query server. 26 tests pass; verified live against real captured
-traffic (SeqScan / HashIndex / TrieScan plans all chosen correctly over TCP).
-Next: Phase 7 (benchmarks + README polish) — the final phase.
+All phases complete (1–7): parser; columnar store; SQL query engine reusing
+QueryX's design; hash / IP-trie / top-N-heap indexes with an index-aware planner;
+live capture (ring buffer + producer/consumer threads + scapy adapter); a
+thread-pool TCP query server; and a benchmark suite + README. 28 tests pass;
+verified live against real captured traffic. The project is feature-complete.
