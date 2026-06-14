@@ -1,88 +1,88 @@
-"""Hand-decode a raw frame into a typed ``Packet`` — the Networks core.
+"""Pure-Python packet parser: raw bytes -> PacketRecord. No scapy.
 
-We walk the nested headers ourselves rather than letting a library do it, since
-understanding the byte layout is the whole point:
+Decodes Ethernet II -> IPv4 -> TCP/UDP/ICMP by hand, and **verifies the IPv4
+header checksum** (one's-complement sum), discarding packets that fail — the
+same integrity check Wireshark performs. Non-IPv4 frames, truncated frames, and
+bad-checksum frames are dropped (``parse_packet`` returns ``None``).
 
-    Ethernet (14 B)  | dst MAC(6) | src MAC(6) | ethertype(2)            |
-       IPv4 (20 B+)  | ver/IHL(1) | ... | TTL(1) | proto(1) | src(4) | dst(4) |
-          TCP (20 B+)| src port(2)| dst port(2)| ...                    |
-          UDP (8 B)  | src port(2)| dst port(2)| len(2) | csum(2)       |
-
-Multi-byte fields in a packet are big-endian ("network byte order"), so we
-unpack them with ``!`` — note this is the opposite of the pcap *file* header,
-which is little-endian.
-
-A frame that is not IPv4, or whose L4 protocol is not TCP/UDP, still yields a
-``Packet`` (with a descriptive ``protocol`` and ``None`` ports) so nothing is
-silently dropped.
+Header layouts:
+    Ethernet (14 B): dst MAC(6) | src MAC(6) | ethertype(2)
+    IPv4 (20 B+):    ver/IHL(1) | TOS(1) | total_len(2) | id(2) | flags/frag(2)
+                     | TTL(1) | proto(1) | checksum(2) | src(4) | dst(4)
+    TCP (20 B+):     src port(2) | dst port(2) | seq(4) | ack(4)
+                     | data-offset(1) | flags(1) | ...
+    UDP (8 B):       src port(2) | dst port(2) | len(2) | checksum(2)
 """
 
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass
 
-from .pcap import RawPacket
+from packetql.capture.pcap import read_packets
+from packetql.schema import PROTO_TCP, PROTO_UDP, PacketRecord
 
-_ETH = struct.Struct("!6s6sH")  # dst MAC, src MAC, ethertype
+_ETH = struct.Struct("!6s6sH")
 _ETHERTYPE_IPV4 = 0x0800
-_PROTO_TCP, _PROTO_UDP, _PROTO_ICMP = 6, 17, 1
-_PORTS = struct.Struct("!HH")   # src port, dst port (first 4 bytes of TCP and UDP)
+_IP = struct.Struct("!BBHHHBBH4s4s")   # through src/dst addresses
+_PORTS = struct.Struct("!HH")
 
 
-@dataclass(frozen=True)
-class Packet:
-    """A parsed packet, flattened to the fields a query cares about."""
+def verify_ip_checksum(header: bytes) -> bool:
+    """One's-complement check of an IPv4 header (incl. its checksum field).
 
-    timestamp: float
-    src_ip: str | None
-    dst_ip: str | None
-    protocol: str               # "TCP" | "UDP" | "ICMP" | "IP-<n>" | "ETH-0x...."
-    src_port: int | None
-    dst_port: int | None
-    size: int                   # length on the wire, in bytes
-    ttl: int | None
-
-
-def _ipv4(addr: bytes) -> str:
-    return ".".join(str(b) for b in addr)
+    Summing all 16-bit words of a valid header folds to 0xFFFF.
+    """
+    if len(header) % 2:
+        header = header + b"\x00"
+    total = 0
+    for i in range(0, len(header), 2):
+        total += (header[i] << 8) | header[i + 1]
+    total = (total & 0xFFFF) + (total >> 16)
+    total = (total & 0xFFFF) + (total >> 16)
+    return total == 0xFFFF
 
 
-def parse_packet(raw: RawPacket) -> Packet:
-    """Decode one captured frame into a ``Packet``."""
-    data = raw.data
-    ts = raw.timestamp
-    size = raw.orig_len
-
+def parse_packet(data: bytes, timestamp: float) -> PacketRecord | None:
+    """Decode one Ethernet frame into a PacketRecord, or None to discard it."""
     if len(data) < _ETH.size:
-        return Packet(ts, None, None, "TRUNCATED", None, None, size, None)
-
+        return None
     _dst_mac, _src_mac, ethertype = _ETH.unpack_from(data, 0)
     if ethertype != _ETHERTYPE_IPV4:
-        return Packet(ts, None, None, f"ETH-0x{ethertype:04x}", None, None, size, None)
+        return None                              # IPv4 only (the schema is uint32 IPs)
 
-    ip_off = _ETH.size
-    if len(data) < ip_off + 20:
-        return Packet(ts, None, None, "TRUNCATED-IP", None, None, size, None)
+    off = _ETH.size
+    if len(data) < off + 20:
+        return None
+    ver_ihl = data[off]
+    if (ver_ihl >> 4) != 4:
+        return None
+    ihl = (ver_ihl & 0x0F) * 4
+    if ihl < 20 or len(data) < off + ihl:
+        return None
+    if not verify_ip_checksum(data[off:off + ihl]):
+        return None                              # corrupt header -> discard
 
-    ver_ihl = data[ip_off]
-    ihl = (ver_ihl & 0x0F) * 4          # IPv4 header length, in bytes (usually 20)
-    ttl = data[ip_off + 8]
-    proto = data[ip_off + 9]
-    src_ip = _ipv4(data[ip_off + 12:ip_off + 16])
-    dst_ip = _ipv4(data[ip_off + 16:ip_off + 20])
-    l4_off = ip_off + ihl
+    _v, _tos, total_len, _id, _ff, ttl, proto, _csum, src, dst = _IP.unpack_from(data, off)
+    src_ip = int.from_bytes(src, "big")
+    dst_ip = int.from_bytes(dst, "big")
 
-    if proto in (_PROTO_TCP, _PROTO_UDP) and len(data) >= l4_off + 4:
-        src_port, dst_port = _PORTS.unpack_from(data, l4_off)
-        name = "TCP" if proto == _PROTO_TCP else "UDP"
-        return Packet(ts, src_ip, dst_ip, name, src_port, dst_port, size, ttl)
-    if proto == _PROTO_ICMP:
-        return Packet(ts, src_ip, dst_ip, "ICMP", None, None, size, ttl)
-    return Packet(ts, src_ip, dst_ip, f"IP-{proto}", None, None, size, ttl)
+    l4 = off + ihl
+    src_port = dst_port = tcp_flags = 0
+    if proto == PROTO_TCP and len(data) >= l4 + 14:
+        src_port, dst_port = _PORTS.unpack_from(data, l4)
+        tcp_flags = data[l4 + 13]                # byte 13 of the TCP header
+    elif proto == PROTO_UDP and len(data) >= l4 + 8:
+        src_port, dst_port = _PORTS.unpack_from(data, l4)
+    # ICMP (and other IP protocols): no ports, flags 0.
+
+    return PacketRecord(timestamp, src_ip, dst_ip, src_port, dst_port, proto, total_len, tcp_flags, ttl)
 
 
-def parse_file(path: str) -> list[Packet]:
-    """Convenience: read a ``.pcap`` and parse every packet in it."""
-    from .pcap import read_packets
-    return [parse_packet(p) for p in read_packets(path)]
+def parse_file(path: str) -> list[PacketRecord]:
+    """Read a .pcap and parse it, dropping packets the parser discards."""
+    out = []
+    for raw in read_packets(path):
+        rec = parse_packet(raw.data, raw.timestamp)
+        if rec is not None:
+            out.append(rec)
+    return out
