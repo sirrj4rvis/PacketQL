@@ -1,85 +1,93 @@
-"""Tests for the index structures and the index-aware query planner."""
+"""Phase 4 tests: bit trie, direct-address port hash, protocol bitmap,
+persistence, and the planner's index choice + compound pushdown."""
 
-from packetql.capture.parser import Packet
-from packetql.index.hash_index import HashIndex
+import os
+
+from packetql.index.bitmap import BitmapIndex
+from packetql.index.hash_index import PortHash
 from packetql.index.indexes import PacketIndexes
-from packetql.index.topn import top_n
-from packetql.index.trie import IPTrie
+from packetql.index.trie import BitTrie
 from packetql.query.executor import run_query
+from packetql.schema import PROTO_TCP, PROTO_UDP, PacketRecord, ip_to_int
 from packetql.storage.columnar import ColumnStore, write_store
 
 
-def test_hash_index():
-    h = HashIndex([10, 20, 10, None, 30, 20])
-    assert h.lookup(10) == [0, 2]
-    assert h.lookup(20) == [1, 5]
-    assert h.lookup(99) == []
-    assert h.distinct_keys == 3
+def test_bit_trie_prefix_and_exact():
+    ips = [ip_to_int(x) for x in ["192.168.0.1", "192.168.0.2", "192.168.5.9", "10.0.0.1"]]
+    t = BitTrie(ips)
+    assert sorted(t.prefix_rows(ip_to_int("192.168.0.0"), 16)) == [0, 1, 2]   # 192.168.%
+    assert t.prefix_count(ip_to_int("192.168.0.0"), 16) == 3
+    assert t.exact_rows(ip_to_int("10.0.0.1")) == [3]
+    assert t.prefix_rows(ip_to_int("172.0.0.0"), 8) == []
 
 
-def test_ip_trie_prefix_and_exact():
-    t = IPTrie(["10.0.5.1", "10.0.5.9", "10.0.6.1", "192.168.1.1", None])
-    assert sorted(t.prefix([10, 0, 5])) == [0, 1]
-    assert sorted(t.prefix([10, 0])) == [0, 1, 2]
-    assert t.prefix([172]) == []
-    assert t.exact("10.0.6.1") == [2]
+def test_direct_address_port_hash():
+    h = PortHash([443, 80, 443, 53])
+    assert h.lookup(443) == [0, 2]
+    assert h.lookup(80) == [1]
+    assert h.lookup(22) == []
+    assert h.count(443) == 2
 
 
-def test_top_n_matches_sort():
-    items = [5, 3, 9, 1, 7, 2, 8]
-    assert top_n(items, 3, lambda x: x, largest=True) == sorted(items, reverse=True)[:3]
-    assert top_n(items, 3, lambda x: x, largest=False) == sorted(items)[:3]
-    assert top_n(items, 100, lambda x: x, largest=True) == sorted(items, reverse=True)
+def test_protocol_bitmap():
+    b = BitmapIndex([6, 17, 6, 1], 4)
+    assert b.rows_for(6) == [0, 2]
+    assert b.rows_for(17) == [1]
+    assert b.count(6) == 2
+    assert (b.bitmap(6) & b.bitmap(1)) == 0       # disjoint protocols
 
 
 def _store(tmp_path):
-    packets = [
-        Packet(1.0, "10.0.5.1", "9.9.9.9", "TCP", 1111, 443, 1500, 64),
-        Packet(2.0, "10.0.5.2", "9.9.9.9", "UDP", 2222, 53, 80, 64),
-        Packet(3.0, "10.0.6.1", "9.9.9.9", "TCP", 3333, 443, 200, 64),
-        Packet(4.0, "192.168.1.1", "9.9.9.9", "TCP", 4444, 80, 1400, 64),
+    recs = [
+        PacketRecord(1.0, ip_to_int("192.168.0.2"), ip_to_int("9.9.9.9"), 1, 443, PROTO_TCP, 1500, 0x10, 64),
+        PacketRecord(2.0, ip_to_int("192.168.0.3"), ip_to_int("9.9.9.9"), 2, 80, PROTO_TCP, 200, 0x10, 64),
+        PacketRecord(3.0, ip_to_int("192.168.0.2"), ip_to_int("8.8.8.8"), 3, 53, PROTO_UDP, 80, 0, 64),
+        PacketRecord(4.0, ip_to_int("10.0.0.1"), ip_to_int("9.9.9.9"), 4, 443, PROTO_UDP, 90, 0, 64),
     ]
-    d = str(tmp_path / "store")
-    write_store(d, packets)
+    d = str(tmp_path / "s")
+    write_store(d, recs)
     return ColumnStore(d)
 
 
-def test_indexed_equals_unindexed(tmp_path):
+def test_index_results_match_scan(tmp_path):
     store = _store(tmp_path)
-    ix = PacketIndexes.build(store, hash_columns=["dst_port"], trie_columns=["src_ip"])
+    ix = PacketIndexes.build(store)
     for q in (
-        "SELECT src_ip, size FROM packets WHERE dst_port = 443",
-        "SELECT src_ip FROM packets WHERE src_ip LIKE '10.0.5.%'",
-        "SELECT src_ip, size FROM packets WHERE dst_port = 443 AND size > 1000",
+        "SELECT size FROM packets WHERE dst_port = 443",
+        "SELECT size FROM packets WHERE proto = 6",
+        "SELECT size FROM packets WHERE src_ip LIKE '192.168.%'",
+        "SELECT size FROM packets WHERE proto = 6 AND dst_port = 443",
+        "SELECT size FROM packets WHERE dst_port = 443 AND size > 1000",
     ):
         assert sorted(run_query(store, q).rows) == sorted(run_query(store, q, indexes=ix).rows)
 
 
-def test_plan_labels(tmp_path):
+def test_planner_picks_each_index(tmp_path):
     store = _store(tmp_path)
-    ix = PacketIndexes.build(store, hash_columns=["dst_port"], trie_columns=["src_ip"])
-    assert "HashIndex" in run_query(store, "SELECT size FROM packets WHERE dst_port = 443", indexes=ix).plan
-    assert "TrieScan" in run_query(store, "SELECT src_ip FROM packets WHERE src_ip LIKE '10.0.5.%'", indexes=ix).plan
-    assert run_query(store, "SELECT size FROM packets WHERE size > 100", indexes=ix).plan.startswith("SeqScan")
+    ix = PacketIndexes.build(store)
+    assert "hash dst_port=443" in run_query(store, "SELECT size FROM packets WHERE dst_port = 443", indexes=ix).plan
+    assert "bitmap proto=6" in run_query(store, "SELECT size FROM packets WHERE proto = 6", indexes=ix).plan
+    assert "trie src_ip" in run_query(store, "SELECT size FROM packets WHERE src_ip LIKE '192.168.%'", indexes=ix).plan
 
 
-def test_like_prefix_without_index(tmp_path):
-    store = _store(tmp_path)  # no indexes -> scan path uses string startswith
-    res = run_query(store, "SELECT src_ip FROM packets WHERE src_ip LIKE '10.0.5.%'")
-    assert sorted(res.rows) == [("10.0.5.1",), ("10.0.5.2",)]
-
-
-def test_order_limit_uses_heap(tmp_path):
+def test_compound_pushdown_intersects(tmp_path):
     store = _store(tmp_path)
-    res = run_query(store, "SELECT size FROM packets ORDER BY size DESC LIMIT 2")
-    assert res.rows == [(1500,), (1400,)]
-    assert "Top-2 heap" in res.plan
+    ix = PacketIndexes.build(store)
+    r = run_query(store, "SELECT size FROM packets WHERE proto = 6 AND dst_port = 443", indexes=ix)
+    assert r.rows == [(1500,)]                                # only the TCP:443 packet
+    assert "bitmap proto=6" in r.plan and "hash dst_port=443" in r.plan
 
 
 def test_residual_filter_after_index(tmp_path):
     store = _store(tmp_path)
-    ix = PacketIndexes.build(store, hash_columns=["dst_port"], trie_columns=["src_ip"])
-    # dst_port=443 -> rows 0 and 2; residual size>1000 keeps only row 0
-    res = run_query(store, "SELECT size FROM packets WHERE dst_port = 443 AND size > 1000", indexes=ix)
-    assert res.rows == [(1500,)]
-    assert "HashIndex" in res.plan
+    ix = PacketIndexes.build(store)
+    r = run_query(store, "SELECT size FROM packets WHERE dst_port = 443 AND size > 1000", indexes=ix)
+    assert r.rows == [(1500,)]                                # index dst_port=443 then residual size>1000
+
+
+def test_persistence_roundtrip(tmp_path):
+    store = _store(tmp_path)
+    PacketIndexes.load_or_build(store)                        # builds + saves
+    assert os.path.exists(os.path.join(store.directory, "indexes.pkl"))
+    ix = PacketIndexes.load_or_build(store)                   # reloads (mtimes match)
+    assert run_query(store, "SELECT size FROM packets WHERE dst_port = 443", indexes=ix).rows == [(1500,), (90,)]
