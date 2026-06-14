@@ -1,0 +1,12 @@
+# Generated data — reproducible from tools/ and the demo scripts
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/

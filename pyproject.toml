@@ -1,0 +1,17 @@
+[project]
+name = "packetql"
+version = "0.1.0"
+description = "A live network packet analyzer with a SQL-like query engine, built from scratch."
+requires-python = ">=3.11"
+dependencies = []  # the offline path is standard-library only
+
+[project.optional-dependencies]
+live = ["scapy>=2.5"]   # only needed for LIVE capture (Phase 5)
+test = ["pytest>=7"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["packetql*"]
