@@ -1,28 +1,14 @@
-"""Phase 2 — the columnar store.
+"""Phase 2 — fixed-width columnar storage.
 
-QueryX stored *rows*: a record's fields sit together on a page. PacketQL stores
-*columns*: every timestamp in one file, every src_ip in another, every size in
-another. The payoff is **selective I/O** — a query for ``size`` opens only
-``size.col`` and never touches the other seven columns. This is how analytical
-stores (Parquet, ClickHouse) work, and it fits packet analytics, where you scan
-many rows but read only a few of their fields.
+Nine columns, one file each; every value is fixed-width, so (a) a query reads
+only the column files it needs, and (b) row N of a column is at byte offset
+N x width — an O(1) seek. Writes are buffered and fsync'd in batches (the
+difference between hundreds and tens-of-thousands of packets/sec). Reads go
+through a small page cache (a buffer pool). meta.json records the schema version,
+row count, and each column's expected size for an integrity check on open.
 
-Two real columnar techniques are implemented:
-
-* **Null bitmap (validity bitmap).** Some fields are absent for some packets — a
-  non-IPv4 frame has no ``src_ip``; an ICMP packet has no ports. Each nullable
-  column writes a bitmap (1 bit per row, 1 = null) ahead of its values, exactly
-  like Arrow/Parquet, rather than burning a sentinel value.
-* **Dictionary encoding.** ``protocol`` is one of a tiny set of strings repeated
-  across every row. We store each distinct string once in a dictionary and keep
-  a 2-byte code per row.
-
-On-disk layout: a store is a directory with one ``<column>.col`` file per column
-plus ``meta.json`` (row count, column kinds, and the protocol dictionary).
-
-Scope: the whole column is read and decoded into a Python list per access — fine
-at this scale and enough to show the selective-I/O win. Block/page layout,
-compression, and lazy per-row iteration are future work.
+Per packet on disk: 8 (ts) + 4 + 4 + 2 + 2 + 1 (proto) + 2 (size) + 1 (flags)
++ 1 (ttl) = 25 bytes across 9 files, vs ~60 for a naive row store.
 """
 
 from __future__ import annotations
@@ -30,198 +16,238 @@ from __future__ import annotations
 import json
 import os
 import struct
-from dataclasses import dataclass
+from collections import OrderedDict
 
-from packetql.capture.parser import Packet
+from packetql.schema import PacketRecord
 
-# Fixed-width encodings, keyed by column "kind". 'dict' stores a uint16 code.
-_STRUCTS = {
-    "i64": struct.Struct("<q"),  # timestamp, in microseconds
-    "u32": struct.Struct("<I"),  # IPv4 address, packet size
-    "u16": struct.Struct("<H"),  # port
-    "u8": struct.Struct("<B"),   # ttl
-    "dict": struct.Struct("<H"),  # dictionary code
-}
+SCHEMA_VERSION = 1
 
-
-@dataclass(frozen=True)
-class ColumnSpec:
-    name: str
-    kind: str
-    nullable: bool
-
-
-#: The packet schema, in column order. ``timestamp`` is stored as int64
-#: microseconds; IPs as uint32; ``protocol`` is dictionary-encoded.
-SCHEMA = [
-    ColumnSpec("timestamp", "i64", False),
-    ColumnSpec("src_ip", "u32", True),
-    ColumnSpec("dst_ip", "u32", True),
-    ColumnSpec("protocol", "dict", False),
-    ColumnSpec("src_port", "u16", True),
-    ColumnSpec("dst_port", "u16", True),
-    ColumnSpec("size", "u32", False),
-    ColumnSpec("ttl", "u8", True),
+# (column name, PacketRecord attribute, struct format, width in bytes)
+COLUMNS = [
+    ("ts", "timestamp", "<d", 8),
+    ("src_ip", "src_ip", "<I", 4),
+    ("dst_ip", "dst_ip", "<I", 4),
+    ("src_port", "src_port", "<H", 2),
+    ("dst_port", "dst_port", "<H", 2),
+    ("proto", "protocol", "<B", 1),
+    ("size", "size", "<H", 2),
+    ("flags", "tcp_flags", "<B", 1),
+    ("ttl", "ttl", "<B", 1),
 ]
-_BY_NAME = {c.name: c for c in SCHEMA}
+COLUMN_NAMES = [name for name, *_ in COLUMNS]
+_BY_NAME = {name: (attr, fmt, width) for name, attr, fmt, width in COLUMNS}
 
 
-# -- value <-> storage-integer conversions ----------------------------------
+def _col_path(directory: str, name: str) -> str:
+    return os.path.join(directory, name + ".col")
 
 
-def _ip_to_int(s: str) -> int:
-    a, b, c, d = (int(x) for x in s.split("."))
-    return (a << 24) | (b << 16) | (c << 8) | d
+def _meta_path(directory: str) -> str:
+    return os.path.join(directory, "meta.json")
 
 
-def _int_to_ip(v: int) -> str:
-    return f"{(v >> 24) & 255}.{(v >> 16) & 255}.{(v >> 8) & 255}.{v & 255}"
+# ---------------------------------------------------------------------------
+# Write path — batched, fsync'd, append-capable
+# ---------------------------------------------------------------------------
 
 
-def _to_storage(name: str, value):
-    """Map a Packet field to the integer actually stored (None stays None)."""
-    if value is None:
-        return None
-    if name in ("src_ip", "dst_ip"):
-        return _ip_to_int(value)
-    if name == "timestamp":
-        return round(value * 1_000_000)
-    return int(value)
+class ColumnWriter:
+    """Append PacketRecords to a store, flushing all column files per batch."""
+
+    def __init__(self, directory: str, batch_size: int = 1000, append: bool = False) -> None:
+        os.makedirs(directory, exist_ok=True)
+        self.directory = directory
+        self.batch_size = batch_size
+        self._structs = {name: struct.Struct(fmt) for name, _, fmt, _ in COLUMNS}
+        self._files = {name: open(_col_path(directory, name), "ab" if append else "wb") for name, *_ in COLUMNS}
+        self._buf: dict[str, list[bytes]] = {name: [] for name, *_ in COLUMNS}
+        self._buffered = 0
+        self.row_count = 0
+        if append and os.path.exists(_meta_path(directory)):
+            with open(_meta_path(directory)) as f:
+                self.row_count = json.load(f)["row_count"]
+
+    def append(self, rec: PacketRecord) -> None:
+        for name, attr, _, _ in COLUMNS:
+            self._buf[name].append(self._structs[name].pack(getattr(rec, attr)))
+        self._buffered += 1
+        if self._buffered >= self.batch_size:
+            self.flush()
+
+    def flush(self) -> None:
+        if self._buffered == 0:
+            return
+        for name, *_ in COLUMNS:
+            fh = self._files[name]
+            fh.write(b"".join(self._buf[name]))
+            fh.flush()
+            os.fsync(fh.fileno())          # durable per batch
+            self._buf[name].clear()
+        self.row_count += self._buffered
+        self._buffered = 0
+        self._write_meta()
+
+    def close(self) -> None:
+        self.flush()
+        for fh in self._files.values():
+            fh.close()
+
+    def __enter__(self) -> "ColumnWriter":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def _write_meta(self) -> None:
+        cols = {name: {"struct": fmt, "width": width, "bytes": self.row_count * width}
+                for name, _, fmt, width in COLUMNS}
+        meta = {"schema_version": SCHEMA_VERSION, "row_count": self.row_count, "columns": cols}
+        with open(_meta_path(self.directory), "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
 
 
-def _from_storage(name: str, value):
-    if value is None:
-        return None
-    if name in ("src_ip", "dst_ip"):
-        return _int_to_ip(value)
-    if name == "timestamp":
-        return value / 1_000_000
-    return value
+def write_store(directory: str, records) -> None:
+    """Create a fresh store from an iterable of PacketRecords."""
+    with ColumnWriter(directory, append=False) as w:
+        for rec in records:
+            w.append(rec)
 
 
-# -- column (de)serialization ------------------------------------------------
+# ---------------------------------------------------------------------------
+# A tiny page cache (buffer pool)
+# ---------------------------------------------------------------------------
 
 
-def _bitmap_len(n: int) -> int:
-    return (n + 7) // 8
+class _PageCache:
+    """Fixed-size pages with global LRU eviction — repeated reads hit RAM."""
+
+    PAGE = 64 * 1024
+
+    def __init__(self, capacity_pages: int = 8) -> None:
+        self._pages: OrderedDict = OrderedDict()
+        self._cap = capacity_pages
+        self.hits = 0
+        self.misses = 0
+
+    def read(self, fh, path: str, byte_off: int, length: int) -> bytes:
+        out = bytearray()
+        pos, end = byte_off, byte_off + length
+        while pos < end:
+            page_no = pos // self.PAGE
+            page = self._page(fh, path, page_no)
+            within = pos - page_no * self.PAGE
+            take = min(self.PAGE - within, end - pos)
+            out += page[within:within + take]
+            pos += take
+        return bytes(out)
+
+    def _page(self, fh, path: str, page_no: int) -> bytes:
+        key = (path, page_no)
+        cached = self._pages.get(key)
+        if cached is not None:
+            self.hits += 1
+            self._pages.move_to_end(key)
+            return cached
+        self.misses += 1
+        fh.seek(page_no * self.PAGE)
+        page = fh.read(self.PAGE)
+        self._pages[key] = page
+        if len(self._pages) > self._cap:
+            self._pages.popitem(last=False)
+        return page
 
 
-def _pack_column(spec: ColumnSpec, storage_values: list) -> bytes:
-    """Encode one column: an optional null bitmap, then the fixed-width values."""
-    s = _STRUCTS[spec.kind]
-    out = bytearray()
-    n = len(storage_values)
-    if spec.nullable:
-        bitmap = bytearray(_bitmap_len(n))
-        for i, v in enumerate(storage_values):
-            if v is None:
-                bitmap[i >> 3] |= 1 << (i & 7)
-        out += bitmap
-    for v in storage_values:
-        out += s.pack(0 if v is None else v)
-    return bytes(out)
-
-
-def _unpack_column(spec: ColumnSpec, data: bytes, n: int) -> list:
-    s = _STRUCTS[spec.kind]
-    pos = 0
-    bitmap = None
-    if spec.nullable:
-        nb = _bitmap_len(n)
-        bitmap = data[:nb]
-        pos = nb
-    values = []
-    for i in range(n):
-        (raw,) = s.unpack_from(data, pos)
-        pos += s.size
-        if bitmap is not None and (bitmap[i >> 3] >> (i & 7)) & 1:
-            values.append(None)
-        else:
-            values.append(raw)
-    return values
-
-
-# -- writing -----------------------------------------------------------------
-
-
-def write_store(directory: str, packets: list[Packet]) -> None:
-    """Write ``packets`` to a columnar store at ``directory`` (one file/column)."""
-    os.makedirs(directory, exist_ok=True)
-    n = len(packets)
-    proto_dict: list[str] = []
-    proto_index: dict[str, int] = {}
-    meta = {"row_count": n, "columns": [], "protocol_dict": proto_dict}
-
-    for spec in SCHEMA:
-        raw = [getattr(p, spec.name) for p in packets]
-        if spec.name == "protocol":
-            codes = []
-            for v in raw:
-                if v not in proto_index:
-                    proto_index[v] = len(proto_dict)
-                    proto_dict.append(v)
-                codes.append(proto_index[v])
-            blob = _pack_column(spec, codes)
-        else:
-            blob = _pack_column(spec, [_to_storage(spec.name, v) for v in raw])
-        with open(os.path.join(directory, spec.name + ".col"), "wb") as f:
-            f.write(blob)
-        meta["columns"].append({"name": spec.name, "kind": spec.kind, "nullable": spec.nullable})
-
-    with open(os.path.join(directory, "meta.json"), "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
-
-
-# -- reading -----------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Read path
+# ---------------------------------------------------------------------------
 
 
 class ColumnStore:
-    """Read-side handle on a columnar store. Reads a column's file only when
-    that column is requested — that lazy, per-column read is the whole point."""
+    """Read-side handle: column scans, O(1) random access, batched iteration."""
 
     def __init__(self, directory: str) -> None:
         self.directory = directory
-        with open(os.path.join(directory, "meta.json"), encoding="utf-8") as f:
+        with open(_meta_path(directory), encoding="utf-8") as f:
             self.meta = json.load(f)
-        self.row_count: int = self.meta["row_count"]
-        self._proto_dict: list[str] = self.meta["protocol_dict"]
-        #: bytes pulled off disk so far — lets a demo prove selective I/O.
+        if self.meta.get("schema_version") != SCHEMA_VERSION:
+            raise ValueError(f"unsupported schema version {self.meta.get('schema_version')}")
+        self.row_count = self.meta["row_count"]
+        self._verify_integrity()
+        self._cache = _PageCache()
+        self._fh: dict[str, object] = {}
         self.bytes_read = 0
 
+    def _verify_integrity(self) -> None:
+        for name, _, _, width in COLUMNS:
+            expected = self.row_count * width
+            actual = os.path.getsize(_col_path(self.directory, name))
+            if actual != expected:
+                raise ValueError(f"column {name!r}: {actual} bytes on disk, expected {expected} "
+                                 f"({self.row_count} rows x {width}) — store is corrupt")
+
     def column_names(self) -> list[str]:
-        return [c["name"] for c in self.meta["columns"]]
+        return list(COLUMN_NAMES)
 
     def column(self, name: str) -> list:
-        """Read and decode a single column (opens only that column's file)."""
-        if name not in _BY_NAME:
-            raise KeyError(f"no such column {name!r}")
-        spec = _BY_NAME[name]
-        with open(os.path.join(self.directory, name + ".col"), "rb") as f:
+        """Read and decode a whole column (a full scan of one column file)."""
+        _attr, fmt, width = _BY_NAME[name]
+        with open(_col_path(self.directory, name), "rb") as f:
             data = f.read()
         self.bytes_read += len(data)
-        raw = _unpack_column(spec, data, self.row_count)
-        if name == "protocol":
-            return [self._proto_dict[code] for code in raw]
-        return [_from_storage(name, v) for v in raw]
+        s = struct.Struct(fmt)
+        return [s.unpack_from(data, i)[0] for i in range(0, len(data), width)]
 
-    def rows(self) -> list[Packet]:
-        """Materialise every column back into Packet records (for round-trips)."""
-        col = {name: self.column(name) for name in self.column_names()}
+    def iter_column(self, name: str, batch_rows: int = 1024):
+        """Yield successive batches of a column's values (for vectorized scans)."""
+        _attr, fmt, width = _BY_NAME[name]
+        s = struct.Struct(fmt)
+        with open(_col_path(self.directory, name), "rb") as f:
+            while True:
+                chunk = f.read(batch_rows * width)
+                if not chunk:
+                    return
+                self.bytes_read += len(chunk)
+                yield [s.unpack_from(chunk, i)[0] for i in range(0, len(chunk), width)]
+
+    def read_rows(self, name: str, row_indices) -> list:
+        """Random access: each row index via an O(1) seek through the page cache."""
+        _attr, fmt, width = _BY_NAME[name]
+        s = struct.Struct(fmt)
+        path = _col_path(self.directory, name)
+        fh = self._fh.get(name)
+        if fh is None:
+            fh = open(path, "rb")
+            self._fh[name] = fh
+        out = []
+        for idx in row_indices:
+            out.append(s.unpack(self._cache.read(fh, path, idx * width, width))[0])
+        return out
+
+    def records(self) -> list[PacketRecord]:
+        """Materialise every column back into PacketRecords (for round-trips)."""
+        col = {name: self.column(name) for name in COLUMN_NAMES}
         return [
-            Packet(
-                timestamp=col["timestamp"][i], src_ip=col["src_ip"][i],
-                dst_ip=col["dst_ip"][i], protocol=col["protocol"][i],
-                src_port=col["src_port"][i], dst_port=col["dst_port"][i],
-                size=col["size"][i], ttl=col["ttl"][i],
+            PacketRecord(
+                timestamp=col["ts"][i], src_ip=col["src_ip"][i], dst_ip=col["dst_ip"][i],
+                src_port=col["src_port"][i], dst_port=col["dst_port"][i], protocol=col["proto"][i],
+                size=col["size"][i], tcp_flags=col["flags"][i], ttl=col["ttl"][i],
             )
             for i in range(self.row_count)
         ]
 
+    @property
+    def cache_hits(self) -> int:
+        return self._cache.hits
+
+    @property
+    def cache_misses(self) -> int:
+        return self._cache.misses
+
+    def close(self) -> None:
+        for fh in self._fh.values():
+            fh.close()
+        self._fh.clear()
+
 
 def store_disk_size(directory: str) -> int:
-    """Total bytes of all column files in a store (excludes meta.json)."""
-    return sum(
-        os.path.getsize(os.path.join(directory, f))
-        for f in os.listdir(directory)
-        if f.endswith(".col")
-    )
+    return sum(os.path.getsize(_col_path(directory, name)) for name in COLUMN_NAMES)
