@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PacketQL</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root{
+    --bg:#0D0F14; --surface:#13161E; --border:#1E2130;
+    --accent:#00D4FF; --violet:#7C5CFC; --red:#FF4560; --green:#00E396;
+    --muted:#6B7280; --label:#9CA3AF; --text:#E5E7EB;
+    --mono:'JetBrains Mono','Fira Code',monospace; --sans:'Inter',sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{background:var(--bg);color:var(--text);font-family:var(--sans);
+       height:100vh;overflow:hidden;display:flex;flex-direction:column;font-size:14px}
+
+  /* top bar */
+  .topbar{display:flex;justify-content:space-between;align-items:center;
+          padding:10px 18px;border-bottom:1px solid var(--border);flex:0 0 auto}
+  .brand{font-weight:600;letter-spacing:.5px;font-size:16px}
+  .brand .x{color:var(--accent)}
+  .topright{display:flex;align-items:center;gap:18px}
+  #clock{font-family:var(--mono);color:var(--label);font-size:13px}
+  .status{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--label);
+          text-transform:uppercase;letter-spacing:.5px}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--green)}
+  .dot.off{background:var(--red)}
+
+  /* layout */
+  .layout{flex:1 1 0;display:flex;flex-direction:column;gap:12px;padding:12px;min-height:0}
+  .row{display:grid;gap:12px;min-height:0}
+  .row-stats{grid-template-columns:repeat(4,1fr);flex:0 0 auto}
+  .row-charts{grid-template-columns:3fr 2fr;flex:1 1 0;min-height:0}
+  .row-tables{grid-template-columns:1fr 1fr;flex:1 1 0;min-height:0}
+  .row-query{flex:0 0 auto}
+
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:8px;
+        padding:20px;min-width:0;min-height:0;display:flex;flex-direction:column}
+  .card-title{color:var(--label);font-size:12px;margin-bottom:12px;flex:0 0 auto}
+
+  /* stat cards */
+  .stat .label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px}
+  .stat .value{font-family:var(--mono);color:var(--accent);font-size:28px;font-weight:500;
+               margin-top:8px;line-height:1.1}
+  .stat .delta{font-size:12px;margin-top:6px;font-family:var(--mono)}
+  .delta.pos{color:var(--green)} .delta.neg{color:var(--red)} .delta.flat{color:var(--muted)}
+  .value.ok{color:var(--green)} .value.bad{color:var(--red)}
+
+  /* charts */
+  .chart-wrap{position:relative;flex:1 1 0;min-height:0}
+  .donut-shell{position:relative;flex:1 1 0;min-height:0}
+  .donut-center{position:absolute;top:0;left:0;right:0;bottom:0;display:flex;
+                flex-direction:column;align-items:center;justify-content:center;pointer-events:none}
+  .donut-center .num{font-family:var(--mono);font-size:26px;color:#fff;font-weight:500}
+  .donut-center .cap{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px}
+  .legend{display:flex;flex-wrap:wrap;gap:12px;margin-top:12px;flex:0 0 auto}
+  .legend .item{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--label)}
+  .legend .sq{width:10px;height:10px;border-radius:2px}
+  .legend .pct{font-family:var(--mono);color:var(--text)}
+
+  /* tables */
+  .scroll{flex:1 1 0;min-height:0;overflow:auto}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{position:sticky;top:0;background:var(--surface);text-align:left;color:var(--muted);
+     font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.5px;
+     padding:8px 10px;border-bottom:1px solid var(--border)}
+  td{padding:8px 10px;border-bottom:1px solid var(--border);font-family:var(--mono);color:var(--text)}
+  th.num,td.num{text-align:right}
+  td.accent{color:var(--accent)}
+  td.rank{color:var(--muted)}
+  tbody tr:hover{background:var(--border)}
+  tr.top td{border-left:2px solid var(--accent)}
+  .pct{position:relative}
+  .pct .bar{position:absolute;left:0;top:3px;bottom:3px;background:rgba(0,212,255,.2);border-radius:2px}
+  .pct .txt{position:relative;font-family:var(--mono)}
+
+  /* query console */
+  .qhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+  .qtitle{color:var(--label);font-size:12px}
+  .qrow{display:flex;gap:10px;align-items:stretch}
+  textarea#sql{flex:1;resize:none;height:52px;background:var(--bg);border:1px solid var(--border);
+       border-radius:4px;color:var(--text);font-family:var(--mono);font-size:13px;padding:10px}
+  textarea#sql:focus{outline:none;border-color:var(--accent)}
+  textarea#sql::placeholder{color:var(--muted)}
+  button{font-family:var(--sans);cursor:pointer;border:none;border-radius:4px}
+  #run{background:var(--accent);color:var(--bg);font-weight:600;padding:0 18px;font-size:13px;align-self:stretch}
+  #explain{background:transparent;color:var(--label);border:1px solid var(--border);
+           padding:4px 12px;font-size:11px;letter-spacing:.5px}
+  #explain.on{background:var(--violet);color:#fff;border-color:var(--violet)}
+  .qmeta{font-family:var(--mono);font-size:12px;color:var(--muted);margin-top:10px;min-height:16px}
+  .qerror{color:var(--red)}
+  .qresult{margin-top:10px;max-height:200px;overflow:auto}
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="brand">Packet<span class="x">QL</span></div>
+    <div class="topright">
+      <span id="clock">--:--:--</span>
+      <span class="status"><span id="dot" class="dot"></span><span id="statusText">connecting</span></span>
+    </div>
+  </div>
+
+  <div class="layout">
+    <!-- Row 1: stat cards -->
+    <div class="row row-stats">
+      <div class="card stat"><div class="label">Total Packets</div><div class="value" id="s_total">—</div><div class="delta flat" id="d_total">—</div></div>
+      <div class="card stat"><div class="label">Packets / sec</div><div class="value" id="s_pps">—</div><div class="delta flat" id="d_pps">—</div></div>
+      <div class="card stat"><div class="label">Bytes / sec</div><div class="value" id="s_bps">—</div><div class="delta flat" id="d_bps">—</div></div>
+      <div class="card stat"><div class="label">Drop Rate</div><div class="value" id="s_drop">—</div><div class="delta flat" id="d_drop">—</div></div>
+    </div>
+
+    <!-- Row 2: traffic + protocol -->
+    <div class="row row-charts">
+      <div class="card"><div class="card-title">Traffic Volume — last 60s</div>
+        <div class="chart-wrap"><canvas id="trafficChart"></canvas></div></div>
+      <div class="card"><div class="card-title">Protocol Distribution</div>
+        <div class="donut-shell">
+          <canvas id="protoChart"></canvas>
+          <div class="donut-center"><div class="num" id="protoTotal">0</div><div class="cap">packets</div></div>
+        </div>
+        <div class="legend" id="protoLegend"></div>
+      </div>
+    </div>
+
+    <!-- Row 3: top talkers + ports -->
+    <div class="row row-tables">
+      <div class="card"><div class="card-title">Top Talkers</div>
+        <div class="scroll">
+          <table><thead><tr>
+            <th>#</th><th>Source IP</th><th class="num">Packets</th><th class="num">Bytes</th><th class="num">% of Total</th>
+          </tr></thead><tbody id="talkersBody"></tbody></table>
+        </div></div>
+      <div class="card"><div class="card-title">Port Activity — TCP destination ports</div>
+        <div class="chart-wrap"><canvas id="portChart"></canvas></div></div>
+    </div>
+
+    <!-- Row 4: query console -->
+    <div class="row row-query">
+      <div class="card">
+        <div class="qhead"><span class="qtitle">Query Console</span>
+          <button id="explain" title="Prepend EXPLAIN to the query">EXPLAIN</button></div>
+        <div class="qrow">
+          <textarea id="sql" spellcheck="false" placeholder="SELECT src_ip, dst_port, COUNT(*) FROM packets WHERE proto = 6 GROUP BY src_ip, dst_port ORDER BY COUNT(*) DESC LIMIT 20"></textarea>
+          <button id="run">RUN &#9654;</button>
+        </div>
+        <div class="qmeta" id="qmeta"></div>
+        <div class="qresult"><table><thead id="qhead"></thead><tbody id="qbody"></tbody></table></div>
+      </div>
+    </div>
+  </div>
+
+<script>
+"use strict";
+const API = "http://127.0.0.1:5000";
+
+/* ---- Logger: no-op unless window.PQL_DEBUG ---- */
+const Logger = { debug(msg){ if (window.PQL_DEBUG) console.log("[PQL]", msg); } };
+
+/* ---- helpers ---- */
+const $ = (id) => document.getElementById(id);
+const PORT_NAMES = {80:"HTTP",443:"HTTPS",53:"DNS",22:"SSH",3306:"MySQL",5432:"PostgreSQL",8080:"HTTP-alt"};
+const PROTO = {6:{name:"TCP",color:"#00D4FF"},17:{name:"UDP",color:"#7C5CFC"},1:{name:"ICMP",color:"#00E396"}};
+const OTHER_COLOR = "#6B7280";
+
+function fmtInt(n){ return Number(n).toLocaleString("en-US"); }
+function fmtBytesRate(b){
+  if (b >= 1048576) return (b/1048576).toFixed(2)+" MB/s";
+  if (b >= 1024)    return (b/1024).toFixed(1)+" KB/s";
+  return Math.round(b)+" B/s";
+}
+function fmtBytes(b){
+  if (b >= 1073741824) return (b/1073741824).toFixed(2)+" GB";
+  if (b >= 1048576)    return (b/1048576).toFixed(2)+" MB";
+  if (b >= 1024)       return (b/1024).toFixed(1)+" KB";
+  return b+" B";
+}
+function deltaText(curr, prev){
+  if (prev === null || prev === undefined || prev <= 0) return {text:"—", cls:"flat"};
+  const pct = (curr - prev) / prev * 100;
+  const sign = pct >= 0 ? "+" : "";
+  return {text:`${sign}${pct.toFixed(0)}% vs last 10s`, cls: pct >= 0 ? "pos" : "neg"};
+}
+function applyDelta(el, d){ el.textContent = d.text; el.className = "delta " + d.cls; }
+
+/* ---- fetch with 3s timeout ---- */
+async function fetchJSON(url, opts){
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 3000);
+  try {
+    const res = await fetch(url, Object.assign({signal: ctrl.signal}, opts || {}));
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || ("HTTP " + res.status));
+    return body;
+  } finally { clearTimeout(timer); }
+}
+function postQuery(sql){
+  return fetchJSON(API + "/api/query", {
+    method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({sql})
+  });
+}
+
+/* ---- Polling manager ---- */
+class PollingManager {
+  constructor(onStatus){ this.entries = []; this.fails = {}; this.onStatus = onStatus; this.connected = null; }
+  register(key, intervalMs, fetcher, onData){
+    this.fails[key] = 0;
+    const entry = { key, intervalMs, fetcher, onData };
+    this.entries.push(entry);
+    const run = () => this._tick(entry);
+    run();
+    entry.timer = setInterval(run, intervalMs);
+  }
+  async _tick(entry){
+    try {
+      const data = await entry.fetcher();
+      this.fails[entry.key] = 0;
+      this._status();
+      try { entry.onData(data); } catch (e) { Logger.debug("render " + entry.key + ": " + e); }
+    } catch (e) {
+      this.fails[entry.key] = (this.fails[entry.key] || 0) + 1;
+      Logger.debug("fetch " + entry.key + " failed (" + this.fails[entry.key] + "): " + e.message);
+      this._status();
+    }
+  }
+  _status(){
+    const down = Object.values(this.fails).some((c) => c >= 3);
+    const connected = !down;
+    if (connected !== this.connected){ this.connected = connected; this.onStatus(connected); }
+  }
+}
+
+/* ---- charts ---- */
+const GRID = "#1E2130", TICK = "#6B7280", LBL = "#9CA3AF";
+let trafficChart, protoChart, portChart;
+
+function initCharts(){
+  trafficChart = new Chart($("trafficChart"), {
+    type:"line",
+    data:{ labels:[], datasets:[
+      { label:"Captured", data:[], borderColor:"#00D4FF", backgroundColor:"transparent", borderWidth:2, pointRadius:0, tension:.25 },
+      { label:"Dropped",  data:[], borderColor:"#FF4560", backgroundColor:"transparent", borderWidth:2, pointRadius:0, tension:.25 }
+    ]},
+    options:{ responsive:true, maintainAspectRatio:false, animation:false,
+      plugins:{ legend:{display:false} },
+      scales:{ x:{ grid:{color:GRID}, ticks:{color:TICK, maxTicksLimit:8, autoSkip:true} },
+               y:{ grid:{color:GRID}, ticks:{color:TICK}, beginAtZero:true } } }
+  });
+  protoChart = new Chart($("protoChart"), {
+    type:"doughnut",
+    data:{ labels:[], datasets:[{ data:[], backgroundColor:[], borderColor:"#13161E", borderWidth:2 }] },
+    options:{ responsive:true, maintainAspectRatio:false, animation:false, cutout:"70%",
+      plugins:{ legend:{display:false}, tooltip:{enabled:true} } }
+  });
+  portChart = new Chart($("portChart"), {
+    type:"bar",
+    data:{ labels:[], datasets:[{ data:[], backgroundColor:"#7C5CFC", categoryPercentage:.6, barThickness:16 }] },
+    options:{ indexAxis:"y", responsive:true, maintainAspectRatio:false, animation:false,
+      plugins:{ legend:{display:false} },
+      scales:{ x:{ grid:{color:GRID}, ticks:{color:TICK}, beginAtZero:true },
+               y:{ grid:{display:false}, ticks:{color:LBL, font:{family:"JetBrains Mono"}} } } }
+  });
+}
+
+/* ---- renderers ---- */
+let lastTotalPackets = 0;
+const statHist = [];   // {t, total, pps, bps}
+
+function renderStats(d){
+  $("s_total").textContent = fmtInt(d.total_packets);
+  $("s_pps").textContent   = fmtInt(d.packets_per_sec);
+  $("s_bps").textContent   = fmtBytesRate(d.bytes_per_sec);
+  lastTotalPackets = d.total_packets;
+
+  const drop = $("s_drop");
+  drop.textContent = d.drop_rate_pct.toFixed(2) + "%";
+  drop.className = "value " + (d.drop_rate_pct > 1 ? "bad" : (d.drop_rate_pct === 0 ? "ok" : ""));
+
+  const now = Date.now();
+  statHist.push({t:now, total:d.total_packets, pps:d.packets_per_sec, bps:d.bytes_per_sec});
+  while (statHist.length && statHist[0].t < now - 15000) statHist.shift();
+  const base = statHist.find((s) => s.t <= now - 9000) || (statHist.length > 1 ? statHist[0] : null);
+  if (base){
+    applyDelta($("d_total"), deltaText(d.total_packets, base.total));
+    applyDelta($("d_pps"),   deltaText(d.packets_per_sec, base.pps));
+    applyDelta($("d_bps"),   deltaText(d.bytes_per_sec, base.bps));
+  }
+  applyDelta($("d_drop"), {text: d.drop_rate_pct === 0 ? "no drops" : "elevated", cls: d.drop_rate_pct > 1 ? "neg" : "flat"});
+}
+
+function renderTimeseries(d){
+  const labels = d.seconds.map((s) => { const t = new Date(s*1000); return t.toLocaleTimeString("en-US",{hour12:false}).slice(3); });
+  trafficChart.data.labels = labels;
+  trafficChart.data.datasets[0].data = d.captured;
+  trafficChart.data.datasets[1].data = d.dropped;
+  trafficChart.update("none");
+}
+
+function renderProtocol(d){
+  if (d.error) return;
+  const buckets = {}; let total = 0;
+  for (const row of d.rows){ const p = row[0], c = row[1]; total += c;
+    const info = PROTO[p]; const name = info ? info.name : "Other";
+    buckets[name] = (buckets[name] || 0) + c;
+  }
+  const order = ["TCP","UDP","ICMP","Other"];
+  const labels = [], data = [], colors = [];
+  for (const name of order){ if (buckets[name]){ labels.push(name); data.push(buckets[name]);
+    colors.push(name==="TCP"?"#00D4FF":name==="UDP"?"#7C5CFC":name==="ICMP"?"#00E396":OTHER_COLOR); } }
+  protoChart.data.labels = labels; protoChart.data.datasets[0].data = data;
+  protoChart.data.datasets[0].backgroundColor = colors; protoChart.update("none");
+  $("protoTotal").textContent = fmtInt(total);
+  const leg = $("protoLegend"); leg.innerHTML = "";
+  labels.forEach((name, i) => {
+    const pct = total ? (data[i]/total*100).toFixed(1) : "0.0";
+    const item = document.createElement("div"); item.className = "item";
+    const sq = document.createElement("span"); sq.className = "sq"; sq.style.background = colors[i];
+    const txt = document.createElement("span"); txt.textContent = name + " ";
+    const p = document.createElement("span"); p.className = "pct"; p.textContent = pct + "%";
+    item.appendChild(sq); item.appendChild(txt); item.appendChild(p); leg.appendChild(item);
+  });
+}
+
+function renderTalkers(d){
+  if (d.error) return;
+  const body = $("talkersBody"); body.innerHTML = "";
+  const denom = lastTotalPackets || d.rows.reduce((a, r) => a + r[1], 0) || 1;
+  d.rows.forEach((row, i) => {
+    const [ip, packets, bytes] = row;
+    const pct = packets / denom * 100;
+    const tr = document.createElement("tr"); if (i === 0) tr.className = "top";
+    const tdRank = document.createElement("td"); tdRank.className = "rank"; tdRank.textContent = (i+1);
+    const tdIp = document.createElement("td"); tdIp.textContent = ip;
+    const tdPk = document.createElement("td"); tdPk.className = "num accent"; tdPk.textContent = fmtInt(packets);
+    const tdBy = document.createElement("td"); tdBy.className = "num accent"; tdBy.textContent = fmtBytes(bytes);
+    const tdPc = document.createElement("td"); tdPc.className = "num pct";
+    const bar = document.createElement("div"); bar.className = "bar"; bar.style.width = Math.min(100, pct).toFixed(1) + "%";
+    const span = document.createElement("span"); span.className = "txt"; span.textContent = pct.toFixed(1) + "%";
+    tdPc.appendChild(bar); tdPc.appendChild(span);
+    tr.append(tdRank, tdIp, tdPk, tdBy, tdPc); body.appendChild(tr);
+  });
+}
+
+function renderPorts(d){
+  if (d.error) return;
+  const labels = d.rows.map((r) => { const p = r[0]; const svc = PORT_NAMES[p]; return svc ? (p + " " + svc) : String(p); });
+  const data = d.rows.map((r) => r[1]);
+  portChart.data.labels = labels; portChart.data.datasets[0].data = data; portChart.update("none");
+}
+
+/* ---- query console ---- */
+let explainOn = false;
+function renderQueryResult(data){
+  const head = $("qhead"), bodyEl = $("qbody"), meta = $("qmeta");
+  head.innerHTML = ""; bodyEl.innerHTML = ""; meta.className = "qmeta";
+  if (data.error){ meta.classList.add("qerror"); meta.textContent = "Error: " + data.error; return; }
+  const cols = data.columns || [];
+  const rows = data.rows || [];
+  const numeric = cols.map((_, j) => rows.length ? typeof rows[0][j] === "number" : false);
+  const htr = document.createElement("tr");
+  cols.forEach((c, j) => { const th = document.createElement("th"); if (numeric[j]) th.className = "num"; th.textContent = c; htr.appendChild(th); });
+  head.appendChild(htr);
+  const shown = rows.slice(0, 500);
+  for (const row of shown){
+    const tr = document.createElement("tr");
+    row.forEach((v, j) => { const td = document.createElement("td"); if (numeric[j]) td.className = "num"; td.textContent = v; tr.appendChild(td); });
+    bodyEl.appendChild(tr);
+  }
+  let m = `Executed in ${data.execution_ms}ms — ${fmtInt(data.row_count)} row${data.row_count === 1 ? "" : "s"}`;
+  if (rows.length > 500) m += `  (showing first 500)`;
+  meta.textContent = m;
+}
+async function runQuery(){
+  let sql = $("sql").value.trim();
+  if (!sql){ sql = $("sql").placeholder; }
+  if (explainOn && !/^\s*explain/i.test(sql)) sql = "EXPLAIN " + sql;
+  $("qmeta").className = "qmeta"; $("qmeta").textContent = "running…";
+  try { renderQueryResult(await postQuery(sql)); }
+  catch (e){ renderQueryResult({error: e.message}); }
+}
+
+/* ---- status + clock ---- */
+function setStatus(connected){
+  $("dot").className = "dot" + (connected ? "" : " off");
+  $("statusText").textContent = connected ? "connected" : "disconnected";
+}
+function tickClock(){ $("clock").textContent = new Date().toLocaleTimeString("en-US", {hour12:false}); }
+
+/* ---- init (no top-level await) ---- */
+function init(){
+  initCharts();
+  tickClock(); setInterval(tickClock, 1000);
+
+  $("run").addEventListener("click", () => { runQuery(); });
+  $("explain").addEventListener("click", () => { explainOn = !explainOn; $("explain").classList.toggle("on", explainOn); });
+  $("sql").addEventListener("keydown", (e) => { if (e.ctrlKey && e.key === "Enter"){ e.preventDefault(); runQuery(); } });
+
+  const PROTO_Q  = "SELECT proto, COUNT(*) FROM packets GROUP BY proto";
+  const TALK_Q   = "SELECT src_ip, COUNT(*), SUM(size) FROM packets GROUP BY src_ip ORDER BY COUNT(*) DESC LIMIT 10";
+  const PORT_Q   = "SELECT dst_port, COUNT(*) FROM packets WHERE proto = 6 GROUP BY dst_port ORDER BY COUNT(*) DESC LIMIT 10";
+
+  const pm = new PollingManager(setStatus);
+  pm.register("stats",      1000, () => fetchJSON(API + "/api/stats"),      renderStats);
+  pm.register("timeseries", 2000, () => fetchJSON(API + "/api/timeseries"), renderTimeseries);
+  pm.register("talkers",    3000, () => postQuery(TALK_Q),                  renderTalkers);
+  pm.register("protocol",   5000, () => postQuery(PROTO_Q),                 renderProtocol);
+  pm.register("ports",      5000, () => postQuery(PORT_Q),                  renderPorts);
+}
+window.addEventListener("DOMContentLoaded", init);
+</script>
+</body>
+</html>
