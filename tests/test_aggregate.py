@@ -33,6 +33,17 @@ def test_avg_returns_float(tmp_path):
     assert r.rows == [(148.0,)]                       # 740 / 5
 
 
+def test_count_star_references_no_column(tmp_path):
+    # Regression: `SELECT COUNT(*)` with no WHERE/GROUP BY references no stored
+    # column, so the planner produced read_columns == [] and the scan generator
+    # looped forever yielding empty batches. The planner now reads the narrowest
+    # column so the row source emits one row per packet.
+    store = _store(tmp_path)
+    assert run_query(store, "SELECT COUNT(*) FROM packets").rows == [(5,)]
+    # variants that also yielded an empty read set
+    assert run_query(store, "SELECT COUNT(*) FROM packets ORDER BY COUNT(*) LIMIT 1").rows == [(5,)]
+
+
 def test_group_by(tmp_path):
     r = run_query(_store(tmp_path),
                   "SELECT dst_port, COUNT(*), SUM(size) FROM packets GROUP BY dst_port ORDER BY dst_port")

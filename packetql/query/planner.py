@@ -87,6 +87,13 @@ def plan_query(select, store, indexes=None) -> Plan:
         if name not in valid:
             raise QueryError(f"no such column {name!r}; columns: {', '.join(COLUMN_NAMES)}")
     read_columns = [c for c in COLUMN_NAMES if c in referenced]
+    if not read_columns:
+        # A query that references no stored column (e.g. `SELECT COUNT(*) FROM
+        # packets` with no WHERE/GROUP BY) still needs the row source to emit one
+        # row per packet. Read the narrowest column so COUNT sees every row.
+        # (Without this the scan generator has zero column iterators and loops
+        # forever yielding empty batches.)
+        read_columns = [min(COLUMN_NAMES, key=lambda c: WIDTHS[c])]
 
     scan_cost = store.row_count * sum(WIDTHS[c] for c in read_columns)
     plan = Plan(read_columns, select.where, ("scan",), scan_cost,
