@@ -14,11 +14,14 @@ class PortHash:
     def __init__(self, values) -> None:
         self.table: list = [None] * _NUM_PORTS
         for row, port in enumerate(values):
-            bucket = self.table[port]
-            if bucket is None:
-                bucket = []
-                self.table[port] = bucket
-            bucket.append(row)
+            self.add(port, row)
+
+    def add(self, port: int, row: int) -> None:
+        bucket = self.table[port]
+        if bucket is None:
+            bucket = []
+            self.table[port] = bucket
+        bucket.append(row)
 
     def lookup(self, port: int) -> list[int]:
         if not 0 <= port < _NUM_PORTS:

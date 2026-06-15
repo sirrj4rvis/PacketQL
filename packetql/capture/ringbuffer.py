@@ -1,24 +1,21 @@
-"""A bounded, thread-safe ring buffer for the capture pipeline (the OS core).
+"""A bounded ring buffer for the capture pipeline — preallocated, head/tail.
 
-Packets arrive (a producer thread) faster than they can be parsed and stored (a
-consumer thread). A fixed-size buffer absorbs bursts; when it is full, the
-**oldest** packet is dropped to make room for the newest — the same lossy
-behaviour Wireshark/tcpdump use under load (a dropped packet is *counted*, not a
-crash). Access is guarded by a Condition (a mutex plus wait/notify): a producer
-appends and notifies; the consumer waits while the buffer is empty.
+Slots are preallocated once (no per-packet allocation on the hot path). A `head`
+pointer advances on write, a `tail` pointer on read, both modulo the capacity;
+the buffer is full when it holds `capacity` items, at which point the **oldest**
+packet is dropped (the tail advances) and `dropped` is incremented — the lossy
+behaviour a sniffer needs (you can't ask the wire to slow down). A
+`threading.Condition` lets the writer thread sleep when the buffer is empty
+rather than spin.
 
-This is the classic bounded-buffer producer/consumer problem; the only twist is
-drop-oldest instead of blocking the producer, because a packet sniffer can't ask
-the network to slow down.
+Note on the GIL: each `put`/`get` does its pointer arithmetic under the lock, so
+a multi-field PacketRecord is published atomically — without the lock, a reader
+could see a half-updated slot.
 """
 
 from __future__ import annotations
 
-import collections
 import threading
-
-#: Returned by get() once the buffer is closed and fully drained.
-CLOSED = object()
 
 
 class RingBuffer:
@@ -26,37 +23,51 @@ class RingBuffer:
         if capacity < 1:
             raise ValueError("capacity must be >= 1")
         self.capacity = capacity
-        self._buf: collections.deque = collections.deque()
+        self._slots: list = [None] * capacity      # preallocated
+        self._head = 0
+        self._tail = 0
+        self._size = 0
         self._cond = threading.Condition()
         self._closed = False
-        self.dropped = 0    # packets discarded because the buffer was full
-        self.enqueued = 0   # packets accepted into the buffer
+        self.dropped = 0
+        self.enqueued = 0
 
     def put(self, item) -> None:
-        """Add an item; if the buffer is full, drop the oldest to make room."""
         with self._cond:
-            if len(self._buf) >= self.capacity:
-                self._buf.popleft()      # drop the OLDEST
+            if self._size == self.capacity:        # full -> drop the oldest
+                self._tail = (self._tail + 1) % self.capacity
+                self._size -= 1
                 self.dropped += 1
-            self._buf.append(item)
+            self._slots[self._head] = item
+            self._head = (self._head + 1) % self.capacity
+            self._size += 1
             self.enqueued += 1
             self._cond.notify()
 
-    def get(self):
-        """Block until an item is available; return CLOSED when closed and empty."""
+    def get_batch(self, max_items: int, timeout: float | None = None) -> list:
+        """Block until items are available (or closed/timeout); return up to N."""
         with self._cond:
-            while not self._buf and not self._closed:
-                self._cond.wait()
-            if self._buf:
-                return self._buf.popleft()
-            return CLOSED
+            while self._size == 0 and not self._closed:
+                if not self._cond.wait(timeout):
+                    return []
+            out = []
+            while self._size > 0 and len(out) < max_items:
+                out.append(self._slots[self._tail])
+                self._slots[self._tail] = None
+                self._tail = (self._tail + 1) % self.capacity
+                self._size -= 1
+            return out
 
     def close(self) -> None:
-        """Signal that no more items will arrive; wakes a waiting consumer."""
         with self._cond:
             self._closed = True
             self._cond.notify_all()
 
+    @property
+    def closed(self) -> bool:
+        with self._cond:
+            return self._closed
+
     def __len__(self) -> int:
         with self._cond:
-            return len(self._buf)
+            return self._size

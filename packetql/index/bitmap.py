@@ -13,7 +13,12 @@ class BitmapIndex:
         self.row_count = row_count
         self._bitmaps: dict[int, int] = {}
         for row, value in enumerate(values):
-            self._bitmaps[value] = self._bitmaps.get(value, 0) | (1 << row)
+            self.add(value, row)
+
+    def add(self, value: int, row: int) -> None:
+        self._bitmaps[value] = self._bitmaps.get(value, 0) | (1 << row)
+        if row + 1 > self.row_count:
+            self.row_count = row + 1
 
     def bitmap(self, value: int) -> int:
         return self._bitmaps.get(value, 0)

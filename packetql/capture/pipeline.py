@@ -1,99 +1,106 @@
-"""The capture pipeline: producer/consumer threads around the ring buffer.
+"""The capture pipeline: a producer (capture) and a writer thread, joined by the
+ring buffer.
 
-A *producer* feeds raw frames into the ring buffer; a *consumer* (writer) thread
-drains it, parses each frame, and collects the packets (flushed to a columnar
-store on demand). The producer can be any iterable of RawPacket — a .pcap replay
-or synthetic test data via ``capture_offline`` — or scapy's live sniffer via
-``capture_live``. Because the producer is abstracted, the OS/threading core is
-fully exercised without a capture device; only ``capture_live`` needs scapy +
-Npcap + Administrator rights.
+The producer parses frames and pushes PacketRecords into the ring buffer; the
+writer thread pulls them in batches, appends them to the columnar store, and
+**updates the indexes incrementally**. Under load it adapts: when the recent drop
+rate exceeds 5% it doubles the write batch (fewer fsyncs, faster drain), and it
+logs the per-batch drop rate. ``capture_offline`` replays an iterable of frames
+(tests / .pcap); ``capture_live`` sniffs with scapy (needs Npcap + admin).
 """
 
 from __future__ import annotations
 
 import threading
 
-from packetql.capture.parser import Packet, parse_packet
+from packetql.capture.parser import parse_packet
 from packetql.capture.pcap import RawPacket
-from packetql.capture.ringbuffer import CLOSED, RingBuffer
-from packetql.storage.columnar import write_store
+from packetql.capture.ringbuffer import RingBuffer
+from packetql.storage.columnar import ColumnWriter
 
 
 class CapturePipeline:
-    """Owns the ring buffer and the consumer/writer thread."""
+    BATCH_CAP = 16384
 
-    def __init__(self, capacity: int = 1024) -> None:
+    def __init__(self, store_dir: str, capacity: int = 4096, batch_size: int = 1000,
+                 indexes=None) -> None:
         self.ring = RingBuffer(capacity)
-        self.packets: list[Packet] = []
-        self._consumer: threading.Thread | None = None
-
-    def _consume(self) -> None:
-        while True:
-            raw = self.ring.get()
-            if raw is CLOSED:
-                return
-            self.packets.append(parse_packet(raw))
+        self._writer = ColumnWriter(store_dir, batch_size=batch_size, append=True)
+        self.batch_size = batch_size
+        self.indexes = indexes
+        self._next_row = self._writer.row_count       # row index of the next appended record
+        self.written = 0
+        self.drop_log: list[float] = []               # per-batch drop rate samples
+        self._last_dropped = 0
+        self._last_enqueued = 0
+        self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        self._consumer = threading.Thread(target=self._consume, name="packetql-writer", daemon=True)
-        self._consumer.start()
+        self._thread = threading.Thread(target=self._run_writer, daemon=True, name="pktql-writer")
+        self._thread.start()
+
+    def _run_writer(self) -> None:
+        while True:
+            batch = self.ring.get_batch(self.batch_size, timeout=0.2)
+            if batch:
+                for rec in batch:
+                    self._writer.append(rec)
+                    if self.indexes is not None:
+                        self.indexes.add(rec, self._next_row)
+                    self._next_row += 1
+                    self.written += 1
+                self._adapt()
+            elif self.ring.closed and len(self.ring) == 0:
+                break
+        self._writer.close()
+
+    def _adapt(self) -> None:
+        d = self.ring.dropped - self._last_dropped
+        e = self.ring.enqueued - self._last_enqueued
+        self._last_dropped, self._last_enqueued = self.ring.dropped, self.ring.enqueued
+        rate = d / e if e else 0.0
+        self.drop_log.append(rate)
+        if rate > 0.05 and self.batch_size < self.BATCH_CAP:    # backpressure -> bigger writes
+            self.batch_size = min(self.batch_size * 2, self.BATCH_CAP)
+            self._writer.batch_size = self.batch_size
 
     def join(self) -> None:
-        if self._consumer is not None:
-            self._consumer.join()
-
-    @property
-    def captured(self) -> int:
-        return len(self.packets)
+        if self._thread is not None:
+            self._thread.join()
 
     @property
     def dropped(self) -> int:
         return self.ring.dropped
 
-    def flush_to_store(self, directory: str) -> None:
-        """Write everything captured so far to a columnar store."""
-        write_store(directory, self.packets)
 
-
-def capture_offline(source, capacity: int = 1024) -> CapturePipeline:
-    """Run the pipeline over an iterable of RawPacket (a .pcap replay or test data).
-
-    The producer runs on its own thread so the producer/consumer hand-off through
-    the ring buffer is real, not simulated.
-    """
-    pipe = CapturePipeline(capacity)
+def capture_offline(raw_packets, store_dir: str, capacity: int = 4096,
+                    batch_size: int = 1000, indexes=None) -> CapturePipeline:
+    """Replay RawPackets through the pipeline into a store (parse on the producer)."""
+    pipe = CapturePipeline(store_dir, capacity, batch_size, indexes)
     pipe.start()
-
-    def produce():
-        for raw in source:
-            pipe.ring.put(raw)
-        pipe.ring.close()
-
-    producer = threading.Thread(target=produce, name="packetql-sniffer")
-    producer.start()
-    producer.join()
+    for raw in raw_packets:
+        rec = parse_packet(raw.data, raw.timestamp)
+        if rec is not None:
+            pipe.ring.put(rec)
+    pipe.ring.close()
     pipe.join()
     return pipe
 
 
-def capture_live(iface=None, count: int = 0, timeout=None, capacity: int = 1024) -> CapturePipeline:
-    """Capture live frames with scapy into the pipeline.
+def capture_live(store_dir: str, iface=None, count: int = 0, timeout=None,
+                 capacity: int = 4096, batch_size: int = 1000, indexes=None) -> CapturePipeline:
+    """Capture live frames with scapy (needs Npcap + Administrator on Windows)."""
+    from scapy.all import sniff
 
-    Requires scapy installed AND Npcap (on Windows) AND Administrator privileges.
-    ``count`` / ``timeout`` bound the capture so it terminates (0 / None means
-    unbounded — stop with Ctrl-C). Each sniffed frame is turned into a RawPacket
-    and pushed through the same ring buffer the offline path uses, so the parser,
-    store, and queries are all identical to the offline pipeline.
-    """
-    from scapy.all import sniff  # imported lazily: only the live path needs scapy
-
-    pipe = CapturePipeline(capacity)
+    pipe = CapturePipeline(store_dir, capacity, batch_size, indexes)
     pipe.start()
 
     def on_packet(pkt):
         data = bytes(pkt)
         ts = float(getattr(pkt, "time", 0.0))
-        pipe.ring.put(RawPacket(int(ts), int((ts % 1) * 1_000_000), len(data), data))
+        rec = parse_packet(data, ts)
+        if rec is not None:
+            pipe.ring.put(rec)
 
     sniff(iface=iface, prn=on_packet, count=count, timeout=timeout, store=False)
     pipe.ring.close()

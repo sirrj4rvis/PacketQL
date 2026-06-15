@@ -25,19 +25,23 @@ class BitTrie:
     def __init__(self, values) -> None:
         self.root = _Node()
         for row, value in enumerate(values):
-            node = self.root
+            self.add(value, row)
+
+    def add(self, value: int, row: int) -> None:
+        """Insert one (IP, row) — used both at build time and for live capture."""
+        node = self.root
+        node.count += 1
+        for b in range(self.DEPTH - 1, -1, -1):
+            bit = (value >> b) & 1
+            nxt = node.child[bit]
+            if nxt is None:
+                nxt = _Node()
+                node.child[bit] = nxt
+            node = nxt
             node.count += 1
-            for b in range(self.DEPTH - 1, -1, -1):
-                bit = (value >> b) & 1
-                nxt = node.child[bit]
-                if nxt is None:
-                    nxt = _Node()
-                    node.child[bit] = nxt
-                node = nxt
-                node.count += 1
-            if node.rows is None:
-                node.rows = []
-            node.rows.append(row)
+        if node.rows is None:
+            node.rows = []
+        node.rows.append(row)
 
     def _descend(self, prefix_value: int, prefix_bits: int):
         node = self.root

@@ -76,6 +76,25 @@ class PacketIndexes:
             store.row_count,
         )
 
+    @classmethod
+    def empty(cls) -> "PacketIndexes":
+        """An empty index set, grown incrementally during live capture."""
+        return cls(
+            {c: BitTrie([]) for c in _TRIE_COLS},
+            {c: PortHash([]) for c in _HASH_COLS},
+            {c: BitmapIndex([], 0) for c in _BITMAP_COLS},
+            0,
+        )
+
+    def add(self, rec, row: int) -> None:
+        """Incrementally index one record at row position ``row``."""
+        self.trie["src_ip"].add(rec.src_ip, row)
+        self.trie["dst_ip"].add(rec.dst_ip, row)
+        self.hash["src_port"].add(rec.src_port, row)
+        self.hash["dst_port"].add(rec.dst_port, row)
+        self.bitmap["proto"].add(rec.protocol, row)
+        self.row_count = max(self.row_count, row + 1)
+
     # -- persistence --------------------------------------------------------
     @staticmethod
     def _mtimes(directory) -> dict:
