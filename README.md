@@ -59,7 +59,7 @@ is needed only for live capture.
 python tools/make_fixture_pcap.py   # write tests/fixtures/sample.pcap (valid checksums + 1 corrupt)
 python demo.py                      # parse -> columnar store -> indexes -> queries (with plans)
 python query.py --store data/demo_store "SELECT proto, dst_port, size FROM packets WHERE proto = 6"
-pytest                              # 49 tests
+pytest                              # 60 tests
 python benchmarks/benchmark_suite.py
 ```
 
