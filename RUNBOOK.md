@@ -204,6 +204,10 @@ python query.py --store data/live_store "SELECT src_ip, dst_ip, src_port, dst_po
   discarded by the parser (PacketQL is IPv4-only by the uint32 schema).
 - **No UDP rows?** Your DNS may be going over IPv6 (discarded). Forcing
   `nslookup <host> 8.8.8.8` sends the query over IPv4 UDP so it gets captured.
+- **No ICMP rows?** ICMP only appears if something pings **during** the capture window — and
+  `capture_live` *blocks* its terminal, so run the ping from a **second** terminal while the
+  capture is live. If `ping 8.8.8.8` is filtered on your network, ping your gateway, which always
+  replies (find it with `ipconfig`, often `192.168.0.1`): `ping -n 40 192.168.0.1`.
 - **`WHERE dst_port = 443` returns nothing** for inbound traffic: on a
   server→client packet, `443` is the *source* port. Use
   `WHERE src_port = 443 OR dst_port = 443`.
@@ -225,7 +229,6 @@ python query.py --store data/live_store "SELECT src_ip, dst_ip, src_port, dst_po
 
 ```powershell
 python benchmarks/benchmark_suite.py
-python benchmarks/index_benchmark.py
 ```
 
 **Expect:** throughput tables (scan vs index, columnar vs row-store, write batching,
