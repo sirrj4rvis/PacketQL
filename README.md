@@ -143,5 +143,7 @@ filters, richer SQL (aggregates, joins), and the `pcapng` format.
 
 ## Documentation
 
+[RUNBOOK.md](RUNBOOK.md) — every command to run the project, from scratch ·
 [CLAUDE.md](CLAUDE.md) — architecture and phase plan · [CONTRACTS.md](CONTRACTS.md)
-— module contracts · [benchmarks/REPORT.md](benchmarks/REPORT.md) — benchmark report.
+— module contracts · [INTERVIEW.md](INTERVIEW.md) — interview defense pack ·
+[benchmarks/REPORT.md](benchmarks/REPORT.md) — benchmark report.
