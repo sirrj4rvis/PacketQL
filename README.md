@@ -3,7 +3,7 @@
 **A live network packet analyzer with a SQL-like query engine — built from scratch in Python.**
 
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
-![tests](https://img.shields.io/badge/tests-49%20passing-success)
+![tests](https://img.shields.io/badge/tests-60%20passing-success)
 ![offline](https://img.shields.io/badge/offline%20engine-stdlib%20only-success)
 
 Capture packets off the wire, decode Ethernet → IP → TCP/UDP/ICMP headers **by
@@ -49,7 +49,7 @@ is needed only for live capture.
 | **Computer Networks** | hand-decoding headers **with IP checksum verification**; a binary-protocol TCP server |
 | **Operating Systems** | producer/consumer ring buffer + adaptive backpressure; thread pool; a **readers-writer lock** |
 | **Data Structures** | **bit-level depth-32 IP trie**, **direct-address port hash**, **protocol bitmap**, ring buffer, top-N heap |
-| **Databases** | fixed-width **columnar store**, a SQL lexer/parser/**cost planner**/**vectorized executor** |
+| **Databases** | fixed-width **columnar store**; SQL lexer/parser/**cost planner**/**vectorized executor**; **GROUP BY / HAVING, aggregates, DISTINCT, EXPLAIN** |
 
 ---
 
@@ -88,13 +88,22 @@ reads loop until the full message arrives (TCP has no message boundaries).
 
 ### Query language
 
-`SELECT [cols|*] FROM packets [WHERE expr] [ORDER BY col [ASC|DESC]] [LIMIT n]`;
-operators `= != <> < > <= >=` with `AND / OR / NOT` and parentheses; `LIKE
-'prefix%'` for IP subnets. Columns: `ts, src_ip, dst_ip, src_port, dst_port,
-proto, size, flags, ttl`. IP literals (`src_ip = '192.168.0.2'`) are converted to
-uint32 in the parser. The planner picks **bitmap** (protocol), **hash** (port),
-or **trie** (IP) and **intersects** them (compound pushdown) when more selective
-than a scan.
+```
+SELECT [DISTINCT] cols | aggregates | * FROM packets
+  [WHERE expr] [GROUP BY cols [HAVING expr]] [ORDER BY col [ASC|DESC]] [LIMIT n]
+EXPLAIN <select>
+```
+Aggregates `COUNT(*)`, `COUNT/SUM/AVG/MIN/MAX(col)`; operators `= != <> < > <= >=`
+with `AND / OR / NOT` and parentheses; `LIKE 'prefix%'` for IP subnets. Columns:
+`ts, src_ip, dst_ip, src_port, dst_port, proto, size, flags, ttl`. IP literals
+(`src_ip = '192.168.0.2'`) are converted to uint32 in the parser. The planner
+picks **bitmap** (protocol), **hash** (port), or **trie** (IP) and **intersects**
+them (compound pushdown) when more selective than a scan; grouping uses a
+**hash-aggregate**. Example — top protocols by traffic:
+
+```sql
+SELECT proto, COUNT(*), SUM(size) FROM packets GROUP BY proto ORDER BY COUNT(*) DESC;
+```
 
 ---
 

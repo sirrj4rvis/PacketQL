@@ -1,11 +1,12 @@
-"""Vectorized executor: a generator pipeline that processes rows in batches.
+"""Vectorized executor with aggregation, DISTINCT, and EXPLAIN.
 
-The scan/filter stages work on **batches of 1024 values at a time** (Python
-lists, column-at-a-time), not row-at-a-time — the same shape DuckDB/ClickHouse
-use. The pipeline is scan -> filter -> (order / limit) -> project, each stage a
-generator. ORDER BY ... LIMIT N keeps a bounded min-heap (O(m log N)) instead of
-a full sort. An index access path (Phase 4) replaces the scan/filter front with
-an index lookup, then projects the selected rows.
+Flow: a row source (vectorized scan+filter, or an index lookup) yields the
+filtered rows (read-column tuples); then `_finish` either
+  * **aggregates** them — hash-group by the GROUP BY key, compute COUNT/SUM/AVG/
+    MIN/MAX per group, apply HAVING (ported from QueryX's HashAggregate), or
+  * **projects** them — select the columns, optional DISTINCT,
+and finally applies ORDER BY (+ a bounded top-N heap when LIMIT is present) and
+LIMIT. `EXPLAIN` returns the plan instead of running it.
 """
 
 from __future__ import annotations
@@ -17,7 +18,8 @@ from dataclasses import dataclass
 from packetql.index.topn import top_n
 from packetql.query import ast
 from packetql.query.parser import parse
-from packetql.query.planner import QueryError, plan_query
+from packetql.query.planner import QueryError, is_aggregated, plan_query
+from packetql.storage.columnar import COLUMN_NAMES
 
 _CMP = {
     "=": operator.eq, "!=": operator.ne, "<": operator.lt,
@@ -39,7 +41,6 @@ class QueryResult:
 
 
 def ip_prefix_range(pattern: str) -> tuple[int, int]:
-    """`'192.168.%'` -> the inclusive uint32 range [192.168.0.0, 192.168.255.255]."""
     core = pattern[:-1] if pattern.endswith("%") else pattern
     known = [int(p) for p in core.split(".") if p != ""]
     low = high = 0
@@ -53,6 +54,7 @@ def ip_prefix_range(pattern: str) -> tuple[int, int]:
     return low, high
 
 
+# -- vectorized WHERE evaluation --------------------------------------------
 def _vector(node, batch, n):
     if isinstance(node, ast.ColumnRef):
         return batch[node.name]
@@ -62,7 +64,6 @@ def _vector(node, batch, n):
 
 
 def evaluate_mask(expr, batch, n) -> list[bool]:
-    """Vectorized predicate evaluation over a batch -> a boolean mask."""
     if isinstance(expr, ast.BinaryOp):
         if expr.op in _CMP:
             op = _CMP[expr.op]
@@ -85,7 +86,6 @@ def evaluate_mask(expr, batch, n) -> list[bool]:
 
 
 def _scan_batches(store, read_columns, batch_rows=1024):
-    """Yield {column: [values]} dicts, 1024 rows at a time, for the needed columns."""
     gens = [store.iter_column(c, batch_rows) for c in read_columns]
     while True:
         try:
@@ -95,42 +95,178 @@ def _scan_batches(store, read_columns, batch_rows=1024):
         yield dict(zip(read_columns, cols))
 
 
-def _scan_path(store, plan):
+def _scan_rows(store, plan):
     read = plan.read_columns
-    col_index = {c: i for i, c in enumerate(read)}
-
-    def filtered_rows():
-        for batch in _scan_batches(store, read):
-            n = len(batch[read[0]])
-            mask = evaluate_mask(plan.where, batch, n) if plan.where is not None else None
-            for i in range(n):
-                if mask is None or mask[i]:
-                    yield tuple(batch[c][i] for c in read)
-
-    return _order_limit_project(filtered_rows(), plan, col_index)
+    for batch in _scan_batches(store, read):
+        n = len(batch[read[0]]) if read else 0
+        mask = evaluate_mask(plan.where, batch, n) if plan.where is not None else None
+        for i in range(n):
+            if mask is None or mask[i]:
+                yield tuple(batch[c][i] for c in read)
 
 
-def _order_limit_project(rows, plan, col_index):
-    if plan.order_by is not None:
-        oi = col_index[plan.order_by.column]
-        if plan.limit is not None:
-            kept = top_n(rows, plan.limit, key=lambda r: r[oi], largest=plan.order_by.descending)
+# -- aggregation ------------------------------------------------------------
+def _compute_agg(agg, group_rows, ridx):
+    if agg.func == "COUNT":
+        return len(group_rows)
+    vals = [r[ridx[agg.arg]] for r in group_rows]
+    if not vals:
+        return 0
+    if agg.func == "SUM":
+        return sum(vals)
+    if agg.func == "AVG":
+        return sum(vals) / len(vals)
+    if agg.func == "MIN":
+        return min(vals)
+    if agg.func == "MAX":
+        return max(vals)
+    raise QueryError(f"unknown aggregate {agg.func!r}")
+
+
+def _having_value(node, grp, ridx, group_by):
+    if isinstance(node, ast.Aggregate):
+        return _compute_agg(node, grp, ridx)
+    if isinstance(node, ast.Literal):
+        return node.value
+    if isinstance(node, ast.ColumnRef):
+        if node.name not in group_by:
+            raise QueryError(f"HAVING column {node.name!r} must be grouped or aggregated")
+        return grp[0][ridx[node.name]]
+    raise QueryError("invalid HAVING operand")
+
+
+def _eval_having(expr, grp, ridx, group_by) -> bool:
+    if isinstance(expr, ast.BinaryOp):
+        if expr.op in _CMP:
+            left = _having_value(expr.left, grp, ridx, group_by)
+            right = _having_value(expr.right, grp, ridx, group_by)
+            return _CMP[expr.op](left, right)
+        if expr.op == "AND":
+            return _eval_having(expr.left, grp, ridx, group_by) and _eval_having(expr.right, grp, ridx, group_by)
+        if expr.op == "OR":
+            return _eval_having(expr.left, grp, ridx, group_by) or _eval_having(expr.right, grp, ridx, group_by)
+    if isinstance(expr, ast.UnaryOp) and expr.op == "NOT":
+        return not _eval_having(expr.operand, grp, ridx, group_by)
+    raise QueryError("invalid HAVING expression")
+
+
+def _aggregate_finish(select, rows, ridx):
+    if select.star:
+        raise QueryError("SELECT * is not allowed with GROUP BY / aggregates")
+    group_by = select.group_by
+    for item in select.columns:
+        if isinstance(item, str) and item not in group_by:
+            raise QueryError(f"column {item!r} must appear in GROUP BY or be aggregated")
+    if not group_by and any(isinstance(i, str) for i in select.columns):
+        raise QueryError("cannot mix a plain column with aggregates without GROUP BY")
+
+    gkeys = [ridx[c] for c in group_by]
+    groups: dict = {}
+    order: list = []
+    for r in rows:
+        key = tuple(r[i] for i in gkeys)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(r)
+    if not group_by and not order:                  # scalar aggregate over zero rows -> one row
+        groups[()] = []
+        order = [()]
+
+    labels = [i.label if isinstance(i, ast.Aggregate) else i for i in select.columns]
+    out = []
+    for key in order:
+        grp = groups[key]
+        if select.having is not None and not _eval_having(select.having, grp, ridx, group_by):
+            continue
+        row = tuple(_compute_agg(i, grp, ridx) if isinstance(i, ast.Aggregate) else grp[0][ridx[i]]
+                    for i in select.columns)
+        out.append(row)
+    if select.distinct:
+        out = _dedup(out)
+    out = _order_limit_labeled(out, labels, select.order_by, select.limit)
+    return labels, out
+
+
+def _dedup(rows):
+    seen, out = set(), []
+    for r in rows:
+        if r not in seen:
+            seen.add(r)
+            out.append(r)
+    return out
+
+
+def _order_limit_labeled(rows, labels, order_by, limit):
+    if order_by is not None:
+        if order_by.column not in labels:
+            raise QueryError(f"ORDER BY {order_by.column!r} must be a selected output column")
+        oi = labels.index(order_by.column)
+        rows = sorted(rows, key=lambda r: r[oi], reverse=order_by.descending)
+    if limit is not None:
+        rows = rows[:limit]
+    return rows
+
+
+def _finish(select, plan, row_source):
+    ridx = {c: i for i, c in enumerate(plan.read_columns)}
+    if is_aggregated(select):
+        return _aggregate_finish(select, list(row_source), ridx)
+
+    out_cols = list(COLUMN_NAMES) if select.star else list(select.columns)
+    out_idx = [ridx[c] for c in out_cols]
+
+    if select.distinct:
+        projected = _dedup([tuple(r[j] for j in out_idx) for r in row_source])
+        if select.order_by is not None:
+            if select.order_by.column not in out_cols:
+                raise QueryError(f"ORDER BY {select.order_by.column!r} must be selected when using DISTINCT")
+            oi = out_cols.index(select.order_by.column)
+            projected = sorted(projected, key=lambda r: r[oi], reverse=select.order_by.descending)
+        if select.limit is not None:
+            projected = projected[:select.limit]
+        return out_cols, projected
+
+    # order (on read columns, so ORDER BY may use unselected columns) -> limit -> project
+    if select.order_by is not None:
+        oi = ridx[select.order_by.column]
+        if select.limit is not None:
+            kept = top_n(row_source, select.limit, key=lambda r: r[oi], largest=select.order_by.descending)
         else:
-            kept = sorted(rows, key=lambda r: r[oi], reverse=plan.order_by.descending)
-    elif plan.limit is not None:
-        kept = list(itertools.islice(rows, plan.limit))
+            kept = sorted(row_source, key=lambda r: r[oi], reverse=select.order_by.descending)
+    elif select.limit is not None:
+        kept = list(itertools.islice(row_source, select.limit))
     else:
-        kept = list(rows)
-    out = [col_index[c] for c in plan.out_columns]
-    return [tuple(r[j] for j in out) for r in kept]
+        kept = list(row_source)
+    return out_cols, [tuple(r[j] for j in out_idx) for r in kept]
+
+
+def _explain(select, store, indexes):
+    plan = plan_query(select, store, indexes)
+    lines = []
+    if select.limit is not None:
+        lines.append(f"Limit: {select.limit}")
+    if select.order_by is not None:
+        lines.append(f"Sort: {select.order_by.column}{' DESC' if select.order_by.descending else ''}")
+    if select.distinct:
+        lines.append("Distinct")
+    if is_aggregated(select):
+        gb = ", ".join(select.group_by) if select.group_by else "(scalar)"
+        lines.append(f"HashAggregate: group by [{gb}]" + ("  + Having" if select.having is not None else ""))
+    lines.append(plan.description)
+    return QueryResult(["QUERY PLAN"], [(ln,) for ln in lines], plan=plan.description)
 
 
 def run_query(store, sql: str, indexes=None) -> QueryResult:
-    select = parse(sql)
+    node = parse(sql)
+    if isinstance(node, ast.Explain):
+        return _explain(node.select, store, indexes)
+    select = node
     plan = plan_query(select, store, indexes)
     if plan.access[0] == "scan":
-        rows = _scan_path(store, plan)
+        row_source = _scan_rows(store, plan)
     else:
-        from packetql.index.access import index_path     # Phase 4
-        rows = index_path(store, plan, indexes)
-    return QueryResult(plan.out_columns, rows, plan.description)
+        from packetql.index.access import filtered_rows
+        row_source = filtered_rows(store, plan)
+    columns, rows = _finish(select, plan, row_source)
+    return QueryResult(columns, rows, plan.description)

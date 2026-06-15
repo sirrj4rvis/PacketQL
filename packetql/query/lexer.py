@@ -25,7 +25,8 @@ class TokenType(Enum):
     EOF = auto()
 
 
-_KEYWORDS = {"SELECT", "FROM", "WHERE", "ORDER", "BY", "LIMIT", "ASC", "DESC", "AND", "OR", "NOT", "LIKE"}
+_KEYWORDS = {"SELECT", "FROM", "WHERE", "ORDER", "BY", "LIMIT", "ASC", "DESC", "AND", "OR", "NOT", "LIKE",
+             "DISTINCT", "GROUP", "HAVING", "EXPLAIN", "COUNT", "SUM", "AVG", "MIN", "MAX"}
 _TWO_CHAR = {"<=", ">=", "!=", "<>"}
 _ONE_CHAR = {"=", "<", ">"}
 

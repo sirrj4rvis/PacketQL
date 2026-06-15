@@ -27,6 +27,9 @@ QUERIES = [
     "SELECT dst_port, size FROM packets WHERE proto = 6 ORDER BY size DESC",
     "SELECT src_ip, dst_port FROM packets WHERE src_ip LIKE '192.168.%'",
     "SELECT size FROM packets WHERE proto = 6 AND dst_port = 443",
+    "SELECT proto, COUNT(*), SUM(size) FROM packets GROUP BY proto ORDER BY COUNT(*) DESC",
+    "SELECT DISTINCT dst_port FROM packets ORDER BY dst_port",
+    "EXPLAIN SELECT dst_port, COUNT(*) FROM packets WHERE proto = 6 GROUP BY dst_port",
 ]
 
 

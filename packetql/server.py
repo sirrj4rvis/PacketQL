@@ -69,7 +69,7 @@ def encode_result(columns, rows) -> bytes:
         out += nb
     out += struct.pack("!I", len(rows))
     for j, name in enumerate(columns):
-        is_float = name == "ts"
+        is_float = name == "ts" or (rows and isinstance(rows[0][j], float))   # ts and AVG(...) are floats
         out += b"f" if is_float else b"i"
         s = struct.Struct("!d") if is_float else struct.Struct("!q")
         for row in rows:

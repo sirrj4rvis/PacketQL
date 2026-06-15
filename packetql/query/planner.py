@@ -1,9 +1,9 @@
-"""Query planner: column pruning + cost estimation (and, in Phase 4, index choice).
-
-It determines exactly which columns must be read (SELECT ∪ WHERE ∪ ORDER BY) so
-the executor never touches the others, and estimates the cost of the access path
-in bytes read. The chosen plan and its cost are reported on the result so they
-can be logged / shown (a mini EXPLAIN).
+"""Query planner: column pruning + cost estimation (+ index choice via the
+index layer's `choose`). It collects exactly the stored columns a query needs —
+across SELECT items, WHERE, GROUP BY, HAVING (incl. aggregate arguments), and a
+non-aggregated ORDER BY — so the executor reads nothing extra, and estimates the
+access cost in bytes (a mini EXPLAIN). Aggregation/DISTINCT/projection happen in
+the executor on the filtered rows.
 """
 
 from __future__ import annotations
@@ -20,17 +20,15 @@ class QueryError(Exception):
 
 @dataclass
 class Plan:
-    out_columns: list
     read_columns: list
     where: object
-    order_by: object
-    limit: object
-    access: tuple        # ("scan",) or ("index", kind, column, op, value)
+    access: tuple        # ("scan",) or ("index", candidate_rows, labels)
     cost: float
     description: str
 
 
 def columns_in(expr) -> set[str]:
+    """Stored columns referenced by a WHERE expression (no aggregates there)."""
     if expr is None or isinstance(expr, ast.Literal):
         return set()
     if isinstance(expr, ast.ColumnRef):
@@ -42,37 +40,63 @@ def columns_in(expr) -> set[str]:
     return set()
 
 
+def having_columns(expr) -> set[str]:
+    """Stored columns referenced in HAVING — plain columns and aggregate args."""
+    if expr is None or isinstance(expr, ast.Literal):
+        return set()
+    if isinstance(expr, ast.Aggregate):
+        return {expr.arg} if expr.arg is not None else set()
+    if isinstance(expr, ast.ColumnRef):
+        return {expr.name}
+    if isinstance(expr, ast.BinaryOp):
+        return having_columns(expr.left) | having_columns(expr.right)
+    if isinstance(expr, ast.UnaryOp):
+        return having_columns(expr.operand)
+    return set()
+
+
+def is_aggregated(select) -> bool:
+    return bool(select.group_by) or any(isinstance(c, ast.Aggregate) for c in select.columns)
+
+
+def referenced_columns(select) -> set[str]:
+    cols: set[str] = set()
+    if select.star:
+        cols |= set(COLUMN_NAMES)
+    else:
+        for item in select.columns:
+            if isinstance(item, ast.Aggregate):
+                if item.arg is not None:
+                    cols.add(item.arg)
+            else:
+                cols.add(item)
+    cols |= columns_in(select.where)
+    cols |= set(select.group_by)
+    cols |= having_columns(select.having)
+    if select.order_by is not None and not is_aggregated(select):
+        cols.add(select.order_by.column)       # a non-aggregated ORDER BY reads a real column
+    return cols
+
+
 def plan_query(select, store, indexes=None) -> Plan:
     if select.table != "packets":
         raise QueryError(f"unknown table {select.table!r} (the only table is 'packets')")
     valid = set(store.column_names())
-    out_columns = store.column_names() if select.star else list(select.columns)
-    referenced = set(out_columns) | columns_in(select.where) | (
-        {select.order_by.column} if select.order_by else set())
+    referenced = referenced_columns(select)
     for name in referenced:
         if name not in valid:
             raise QueryError(f"no such column {name!r}; columns: {', '.join(COLUMN_NAMES)}")
-    read_columns = [c for c in COLUMN_NAMES if c in referenced]   # stable column order
+    read_columns = [c for c in COLUMN_NAMES if c in referenced]
 
     scan_cost = store.row_count * sum(WIDTHS[c] for c in read_columns)
-    plan = Plan(out_columns, read_columns, select.where, select.order_by, select.limit,
-                ("scan",), scan_cost, f"SeqScan (est. {scan_cost} B; reads {len(read_columns)}/9 columns)")
+    plan = Plan(read_columns, select.where, ("scan",), scan_cost,
+                f"SeqScan (est. {scan_cost} B; reads {len(read_columns)}/{len(COLUMN_NAMES)} columns)")
 
-    if indexes is not None:
-        _consider_index(plan, select.where, store, indexes, scan_cost)
+    if indexes is not None and select.where is not None:
+        chooser = getattr(indexes, "choose", None)
+        if chooser is not None:
+            chosen = chooser(select.where, store, scan_cost)
+            if chosen is not None:
+                access, cost, residual, desc = chosen
+                plan.access, plan.cost, plan.where, plan.description = access, cost, residual, desc
     return plan
-
-
-def _consider_index(plan, where, store, indexes, scan_cost) -> None:
-    """Phase 4 hook: pick an index access path when it's cheaper than a scan.
-
-    Filled in once the index layer exists; for now (no indexes / Phase 3) the
-    plan stays a SeqScan.
-    """
-    chooser = getattr(indexes, "choose", None)
-    if chooser is None:
-        return
-    chosen = chooser(where, store, scan_cost)        # -> (access, cost, residual, desc) | None
-    if chosen is not None:
-        access, cost, residual, desc = chosen
-        plan.access, plan.cost, plan.where, plan.description = access, cost, residual, desc

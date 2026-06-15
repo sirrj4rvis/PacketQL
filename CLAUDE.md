@@ -80,6 +80,8 @@ size** ([packetql/schema.py](packetql/schema.py); contracts in
 - **Query** — hand-written lexer (INTEGER/FLOAT/STRING/…), recursive-descent
   parser (IP-string → uint32), **cost-estimating planner** with column pruning,
   and a **vectorized 1024-row generator-pipeline executor** + bounded top-N heap.
+  Analytics SQL: **GROUP BY / HAVING, aggregates (COUNT/SUM/AVG/MIN/MAX),
+  DISTINCT, and EXPLAIN** (hash-aggregate, ported from QueryX).
 - **Indexes** — **bit-level depth-32 IP trie**, **direct-address 65536 port
   hash**, **protocol bitmap**, on-disk **persistence** (mtime reload), and
   **compound predicate pushdown** (intersect index row-sets).
@@ -92,6 +94,6 @@ size** ([packetql/schema.py](packetql/schema.py); contracts in
   write throughput by batch size, concurrent-client throughput
   ([benchmarks/REPORT.md](benchmarks/REPORT.md)).
 
-**49 tests pass.** Scope note: now **IPv4-only** (the uint32 schema); IPv6/VLAN
+**60 tests pass.** Scope note: now **IPv4-only** (the uint32 schema); IPv6/VLAN
 frames are discarded by the parser. Remaining honest limits: the bit-trie is
 memory-heavy at very large N; Python's GIL caps CPU-bound concurrency.

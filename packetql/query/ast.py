@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -13,6 +13,16 @@ class ColumnRef:
 @dataclass(frozen=True)
 class Literal:
     value: object        # int, float, or str (IP-string literals become int in the parser)
+
+
+@dataclass(frozen=True)
+class Aggregate:
+    func: str            # COUNT, SUM, AVG, MIN, MAX
+    arg: object          # column name (str), or None for COUNT(*)
+
+    @property
+    def label(self) -> str:
+        return f"{self.func}(*)" if self.arg is None else f"{self.func}({self.arg})"
 
 
 @dataclass(frozen=True)
@@ -36,12 +46,20 @@ class OrderBy:
 
 @dataclass(frozen=True)
 class SelectNode:
-    columns: list        # list[str] of column names, or ["*"]
+    columns: list                       # items: column-name str, "*", or Aggregate
     table: str
     where: object = None
-    order_by: object = None     # OrderBy | None
-    limit: object = None        # int | None
+    distinct: bool = False
+    group_by: list = field(default_factory=list)
+    having: object = None
+    order_by: object = None             # OrderBy | None
+    limit: object = None                # int | None
 
     @property
     def star(self) -> bool:
         return self.columns == ["*"]
+
+
+@dataclass(frozen=True)
+class Explain:
+    select: SelectNode
