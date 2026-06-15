@@ -7,6 +7,7 @@ columnar store, build indexes, and run queries (showing the chosen plan).
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -59,6 +60,10 @@ def main() -> None:
         print("fixture missing - run: python tools/make_fixture_pcap.py")
         return
     store_dir = os.path.join(ROOT, "data", "demo_store")
+    # The capture pipeline appends (live capture grows a store); for a reproducible
+    # one-shot demo we start from a clean store so re-runs don't accumulate dupes.
+    if os.path.exists(store_dir):
+        shutil.rmtree(store_dir)
     pipe = capture_offline(read_packets(FIXTURE), store_dir)
     print(f"parsed + stored {pipe.written} packets through the capture pipeline "
           f"(1 bad-checksum frame discarded, 0 dropped)")
