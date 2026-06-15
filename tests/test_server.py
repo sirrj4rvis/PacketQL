@@ -48,6 +48,30 @@ def test_encode_decode_result_roundtrip():
     assert c == cols and r == rows
 
 
+def test_encode_decode_string_column():
+    # Regression: the wire protocol must carry string columns (EXPLAIN plan text);
+    # previously strings were packed as int64 -> "required argument is not an integer".
+    cols = ["QUERY PLAN"]
+    rows = [("Limit: 20",), ("HashAggregate: group by [dst_port]",), ("SeqScan (est. 5 B)",)]
+    c, r = decode_result(encode_result(cols, rows))
+    assert c == cols and r == rows
+
+
+def test_explain_over_wire(tmp_path):
+    # EXPLAIN returns text rows; sending it through the server must not crash.
+    srv = QueryServer(_store(tmp_path), port=0, workers=2)
+    srv.start()
+    try:
+        status, payload = _client(srv.port, QUERY,
+                                  b"EXPLAIN SELECT dst_port, COUNT(*) FROM packets GROUP BY dst_port")
+        assert status == OK
+        cols, rows = decode_result(payload)
+        assert cols == ["QUERY PLAN"]
+        assert "HashAggregate" in "\n".join(row[0] for row in rows)
+    finally:
+        srv.stop()
+
+
 def _client(port, kind, payload=b""):
     with socket.create_connection(("127.0.0.1", port)) as s:
         send_frame(s, kind, payload)

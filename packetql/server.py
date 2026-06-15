@@ -60,7 +60,13 @@ def recv_frame(sock: socket.socket) -> tuple[int, bytes]:
 
 
 def encode_result(columns, rows) -> bytes:
-    """Column-major binary: names, row count, then each column's typed values."""
+    """Column-major binary: names, row count, then each column's typed values.
+
+    Per-column type tag: 'f' = double (ts / AVG), 's' = length-prefixed UTF-8
+    string (e.g. EXPLAIN's plan text), 'i' = int64 (everything else). The string
+    case matters: without it, EXPLAIN's text rows get packed as int64 and raise
+    "required argument is not an integer".
+    """
     out = bytearray()
     out.append(len(columns))
     for name in columns:
@@ -69,11 +75,22 @@ def encode_result(columns, rows) -> bytes:
         out += nb
     out += struct.pack("!I", len(rows))
     for j, name in enumerate(columns):
-        is_float = name == "ts" or (rows and isinstance(rows[0][j], float))   # ts and AVG(...) are floats
-        out += b"f" if is_float else b"i"
-        s = struct.Struct("!d") if is_float else struct.Struct("!q")
-        for row in rows:
-            out += s.pack(row[j])
+        sample = rows[0][j] if rows else 0
+        if name == "ts" or isinstance(sample, float):
+            out += b"f"
+            packer = struct.Struct("!d")
+            for row in rows:
+                out += packer.pack(row[j])
+        elif isinstance(sample, str):
+            out += b"s"
+            for row in rows:
+                rb = str(row[j]).encode()
+                out += struct.pack("!I", len(rb)) + rb
+        else:
+            out += b"i"
+            packer = struct.Struct("!q")
+            for row in rows:
+                out += packer.pack(row[j])
     return bytes(out)
 
 
@@ -88,10 +105,15 @@ def decode_result(payload: bytes):
     coldata = []
     for _ in range(ncols):
         typ = payload[pos:pos + 1]; pos += 1
-        s = struct.Struct("!d") if typ == b"f" else struct.Struct("!q")
         vals = []
-        for _ in range(nrows):
-            vals.append(s.unpack_from(payload, pos)[0]); pos += s.size
+        if typ == b"s":
+            for _ in range(nrows):
+                (ln,) = struct.unpack_from("!I", payload, pos); pos += 4
+                vals.append(payload[pos:pos + ln].decode()); pos += ln
+        else:
+            unpacker = struct.Struct("!d") if typ == b"f" else struct.Struct("!q")
+            for _ in range(nrows):
+                vals.append(unpacker.unpack_from(payload, pos)[0]); pos += unpacker.size
         coldata.append(vals)
     rows = [tuple(coldata[j][i] for j in range(ncols)) for i in range(nrows)]
     return columns, rows
