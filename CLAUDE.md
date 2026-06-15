@@ -94,6 +94,6 @@ size** ([packetql/schema.py](packetql/schema.py); contracts in
   write throughput by batch size, concurrent-client throughput
   ([benchmarks/REPORT.md](benchmarks/REPORT.md)).
 
-**60 tests pass.** Scope note: now **IPv4-only** (the uint32 schema); IPv6/VLAN
+**64 tests pass.** Scope note: now **IPv4-only** (the uint32 schema); IPv6/VLAN
 frames are discarded by the parser. Remaining honest limits: the bit-trie is
 memory-heavy at very large N; Python's GIL caps CPU-bound concurrency.

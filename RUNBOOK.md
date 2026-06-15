@@ -54,7 +54,7 @@ cd PacketQL
 python -m pytest -q
 ```
 
-**Expect:** `61 passed`. If this passes, the engine is sound end to end.
+**Expect:** `64 passed`. If this passes, the engine is sound end to end.
 
 ---
 
@@ -206,6 +206,8 @@ python query.py --store data/live_store "SELECT src_ip, dst_ip, src_port, dst_po
   *outbound* packets are captured before the card computes their IP checksum, so a strict check
   would drop all of them. PacketQL skips checksum verification on the live path (the offline
   `.pcap` path still verifies strictly), so you see your own traffic, not just inbound.
+- **A 0-packet capture is still valid.** If a capture sees no traffic, you get an empty but
+  openable store — `SELECT COUNT(*) FROM packets` returns `0` rather than an error.
 - **No UDP rows?** Your DNS may be going over IPv6 (discarded). Forcing
   `nslookup <host> 8.8.8.8` sends the query over IPv4 UDP so it gets captured.
 - **No ICMP rows?** ICMP only appears if something pings **during** the capture window — and

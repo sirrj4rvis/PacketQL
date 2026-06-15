@@ -29,7 +29,7 @@ Over-prepare: **#3 (columnar)**, **#4 (the three indexes)**, and **#6 (ring buff
 | Ring buffer | preallocated head/tail, **drop-oldest** on full | `capture/ringbuffer.py` |
 | Wire protocol | `[4-byte len][1-byte type]` (QUERY/PING/STATS) | `server.py` |
 | Concurrency | thread pool + **writer-preferring RWLock** | `server.py` |
-| Test count | 60 passing | `pytest` |
+| Test count | 64 passing | `pytest` |
 
 ---
 

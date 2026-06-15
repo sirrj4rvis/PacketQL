@@ -1,7 +1,7 @@
 # PacketQL — Resume Bullets
 
 Factual, defensible bullets. Every claim traces to the code, the benchmark suite
-([benchmarks/REPORT.md](benchmarks/REPORT.md)), or the pytest suite (currently 60 tests —
+([benchmarks/REPORT.md](benchmarks/REPORT.md)), or the pytest suite (currently 64 tests —
 re-check with `pytest` before submitting). PacketQL is the **sibling to QueryX**; see the
 combined "portfolio framing" at the bottom for using both together.
 
@@ -17,7 +17,7 @@ server). Offline engine is standard-library only.
 - Built a **network packet analyzer with a SQL query engine** from scratch in Python:
   hand-decoded Ethernet/IPv4/TCP/UDP/ICMP headers (with **one's-complement IP-checksum
   verification**), a fixed-width **columnar** store, a cost-estimating planner, and a
-  **vectorized (1024-row-batch) executor** — 60-test pytest suite.
+  **vectorized (1024-row-batch) executor** — 64-test pytest suite.
 - Implemented **three purpose-built indexes** — a bit-level depth-32 **IP trie** (subnet/prefix
   queries), a direct-address **port hash**, and a **protocol bitmap** — with **compound
   predicate pushdown** (intersecting index row-sets); indexed equality runs **100–350× faster
@@ -41,7 +41,7 @@ server). Offline engine is standard-library only.
   **vectorized executor** over **bit-trie / port-hash / bitmap** indexes with compound pushdown.
   Includes a producer/consumer ring-buffer capture pipeline and a binary-protocol thread-pool TCP
   server with a readers-writer lock. Adds analytics SQL — `GROUP BY`/`HAVING`, `COUNT/SUM/AVG/
-  MIN/MAX`, `DISTINCT`, `EXPLAIN` — via a hash-aggregate. 60 pytest cases; charted benchmarks.
+  MIN/MAX`, `DISTINCT`, `EXPLAIN` — via a hash-aggregate. 64 pytest cases; charted benchmarks.
 - **Spans four subjects in one system:** Computer Networks (header decoding, TCP server),
   Operating Systems (ring buffer + condition variable, thread pool, readers-writer lock), Data
   Structures (trie, hash, bitmap, ring buffer, top-N heap), and Databases (columnar store, SQL
@@ -65,7 +65,7 @@ If you have room for both, frame them as a **pair that shows range and architect
 > engine (paged storage, B+ tree/hash indexes, volcano executor, cost-based optimizer, WAL crash
 > recovery; 327 tests). **PacketQL** — a packet analyzer + SQL engine that **reuses QueryX's
 > query-engine architecture** over a **columnar** store, adding hand-parsed networking and a
-> threaded TCP server (60 tests). Together they demonstrate database internals end-to-end and the
+> threaded TCP server (64 tests). Together they demonstrate database internals end-to-end and the
 > ability to re-apply a design across two storage models (row vs columnar, volcano vs vectorized).
 
 Lead with **QueryX** (the database-internals depth interviewers probe) and use **PacketQL** as

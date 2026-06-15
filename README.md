@@ -3,7 +3,7 @@
 **A live network packet analyzer with a SQL-like query engine — built from scratch in Python.**
 
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
-![tests](https://img.shields.io/badge/tests-60%20passing-success)
+![tests](https://img.shields.io/badge/tests-64%20passing-success)
 ![offline](https://img.shields.io/badge/offline%20engine-stdlib%20only-success)
 
 Capture packets off the wire, decode Ethernet → IP → TCP/UDP/ICMP headers **by
@@ -59,7 +59,7 @@ is needed only for live capture.
 python tools/make_fixture_pcap.py   # write tests/fixtures/sample.pcap (valid checksums + 1 corrupt)
 python demo.py                      # parse -> columnar store -> indexes -> queries (with plans)
 python query.py --store data/demo_store "SELECT proto, dst_port, size FROM packets WHERE proto = 6"
-pytest                              # 60 tests
+pytest                              # 64 tests
 python benchmarks/benchmark_suite.py
 ```
 

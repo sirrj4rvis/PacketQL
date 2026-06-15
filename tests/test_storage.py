@@ -38,6 +38,20 @@ def test_round_trip_exact(tmp_path):
     assert store.records() == recs        # exact: timestamp is a double, rest ints
 
 
+def test_empty_store_is_valid(tmp_path):
+    # Regression: a store with zero records must still write meta.json and open
+    # cleanly (e.g. a live capture that sees no traffic). Previously flush()
+    # short-circuited on an empty buffer, so meta.json was never written and the
+    # store could not be opened.
+    from packetql.query.executor import run_query
+    d = str(tmp_path / "empty")
+    write_store(d, [])
+    store = ColumnStore(d)
+    assert store.row_count == 0
+    assert store.records() == []
+    assert run_query(store, "SELECT COUNT(*) FROM packets").rows == [(0,)]
+
+
 def test_nine_fixed_width_columns(tmp_path):
     d = str(tmp_path / "s")
     write_store(d, _records(10))

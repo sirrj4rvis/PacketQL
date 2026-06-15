@@ -67,6 +67,11 @@ class ColumnWriter:
         if append and os.path.exists(_meta_path(directory)):
             with open(_meta_path(directory)) as f:
                 self.row_count = json.load(f)["row_count"]
+        # Write meta.json up front so the store is always valid/openable — even if
+        # zero records are ever appended (e.g. a live capture that sees no traffic).
+        # Without this, flush() short-circuits on an empty buffer and never writes
+        # meta, leaving a store that can't be opened.
+        self._write_meta()
 
     def append(self, rec: PacketRecord) -> None:
         for name, attr, _, _ in COLUMNS:
