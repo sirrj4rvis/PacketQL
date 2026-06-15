@@ -2,6 +2,7 @@
 the thread pool, and the readers-writer lock."""
 
 import os
+import shutil
 import socket
 import struct
 import threading
@@ -66,6 +67,25 @@ def test_query_ping_stats(tmp_path):
         cols, rows = decode_result(payload)
         assert cols == ["dst_port"] and [r[0] for r in rows] == [443, 443, 51000]
         assert _client(srv.port, QUERY, b"SELECT nope FROM packets")[0] == ERROR
+    finally:
+        srv.stop()
+
+
+def test_server_survives_vanished_store(tmp_path):
+    # Regression: if the served store directory is deleted while the server runs
+    # (e.g. a later step's Remove-Item), requests must fail with a clean ERROR
+    # frame, not a dropped/aborted connection — and the worker pool must survive.
+    d = _store(tmp_path)
+    srv = QueryServer(d, port=0, workers=2)
+    srv.start()
+    try:
+        assert _client(srv.port, PING) == (OK, b"pong")     # healthy while present
+        shutil.rmtree(d)                                    # store removed out from under the server
+        assert _client(srv.port, PING) == (OK, b"pong")     # PING needs no store
+        assert _client(srv.port, QUERY, b"SELECT COUNT(*) FROM packets")[0] == ERROR
+        assert _client(srv.port, STATS)[0] == ERROR
+        for _ in range(5):                                  # pool intact after repeated failures
+            assert _client(srv.port, PING) == (OK, b"pong")
     finally:
         srv.stop()
 

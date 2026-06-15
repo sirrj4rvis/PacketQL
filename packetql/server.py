@@ -222,7 +222,9 @@ class QueryServer:
             conn, _addr = item
             try:
                 self._serve(conn)
-            except (ConnectionError, OSError):
+            except Exception:
+                # A worker must survive ANY per-connection failure — one bad
+                # request (or a store that vanished) must never shrink the pool.
                 pass
             finally:
                 try:
@@ -231,7 +233,11 @@ class QueryServer:
                     pass
 
     def _serve(self, conn: socket.socket) -> None:
-        store = ColumnStore(self.store_dir)      # per-connection: no shared mutable store state
+        # The store is opened lazily, per connection (no shared mutable state).
+        # Opening can fail if the store directory was removed/rebuilt while the
+        # server runs; PING never needs it, and STATS/QUERY then return a clean
+        # ERROR frame instead of dropping the socket (a confusing TCP abort).
+        store = None
         while True:
             try:
                 kind, payload = recv_frame(conn)
@@ -239,7 +245,14 @@ class QueryServer:
                 return
             if kind == PING:
                 send_frame(conn, OK, b"pong")
-            elif kind == STATS:
+                continue
+            if store is None:
+                try:
+                    store = ColumnStore(self.store_dir)
+                except Exception as exc:
+                    send_frame(conn, ERROR, f"store unavailable: {exc}".encode())
+                    continue
+            if kind == STATS:
                 with self.lock.read_locked():
                     info = f"rows={store.row_count} queries={self._queries} workers={self.num_workers}"
                 send_frame(conn, OK, info.encode())
@@ -252,6 +265,8 @@ class QueryServer:
                     send_frame(conn, OK, encode_result(result.columns, result.rows))
                 except (QueryError, SQLSyntaxError) as exc:
                     send_frame(conn, ERROR, str(exc).encode())
+                except Exception as exc:                  # never let an unexpected error drop the socket
+                    send_frame(conn, ERROR, f"internal error: {exc}".encode())
             else:
                 send_frame(conn, ERROR, b"unknown message type")
 
