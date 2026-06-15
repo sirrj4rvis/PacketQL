@@ -5,6 +5,13 @@ header checksum** (one's-complement sum), discarding packets that fail — the
 same integrity check Wireshark performs. Non-IPv4 frames, truncated frames, and
 bad-checksum frames are dropped (``parse_packet`` returns ``None``).
 
+Checksum verification is on by default for offline ``.pcap`` parsing (where a bad
+checksum really means a corrupt frame). LIVE capture disables it: with NIC
+transmit checksum offload, the host's own *outbound* packets are handed to the
+card with a blank IP checksum and captured before the card fills it in, so a
+strict check would silently drop all outgoing traffic. Wireshark turns checksum
+validation off by default for exactly this reason.
+
 Header layouts:
     Ethernet (14 B): dst MAC(6) | src MAC(6) | ethertype(2)
     IPv4 (20 B+):    ver/IHL(1) | TOS(1) | total_len(2) | id(2) | flags/frag(2)
@@ -42,8 +49,14 @@ def verify_ip_checksum(header: bytes) -> bool:
     return total == 0xFFFF
 
 
-def parse_packet(data: bytes, timestamp: float) -> PacketRecord | None:
-    """Decode one Ethernet frame into a PacketRecord, or None to discard it."""
+def parse_packet(data: bytes, timestamp: float, verify_checksum: bool = True) -> PacketRecord | None:
+    """Decode one Ethernet frame into a PacketRecord, or None to discard it.
+
+    ``verify_checksum`` defaults to True (offline ``.pcap``: a bad IP-header
+    checksum means a corrupt frame, so drop it). Live capture passes False —
+    NIC checksum offload blanks the checksum on the host's own outbound packets,
+    so verifying would drop all outgoing traffic (see the module docstring).
+    """
     if len(data) < _ETH.size:
         return None
     _dst_mac, _src_mac, ethertype = _ETH.unpack_from(data, 0)
@@ -59,8 +72,8 @@ def parse_packet(data: bytes, timestamp: float) -> PacketRecord | None:
     ihl = (ver_ihl & 0x0F) * 4
     if ihl < 20 or len(data) < off + ihl:
         return None
-    if not verify_ip_checksum(data[off:off + ihl]):
-        return None                              # corrupt header -> discard
+    if verify_checksum and not verify_ip_checksum(data[off:off + ihl]):
+        return None                              # corrupt header -> discard (offline path)
 
     _v, _tos, total_len, _id, _ff, ttl, proto, _csum, src, dst = _IP.unpack_from(data, off)
     src_ip = int.from_bytes(src, "big")

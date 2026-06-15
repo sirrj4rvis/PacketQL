@@ -98,7 +98,11 @@ def capture_live(store_dir: str, iface=None, count: int = 0, timeout=None,
     def on_packet(pkt):
         data = bytes(pkt)
         ts = float(getattr(pkt, "time", 0.0))
-        rec = parse_packet(data, ts)
+        # Live capture: don't verify the IP checksum. NIC transmit checksum
+        # offload blanks the checksum on the host's own outbound packets (they're
+        # captured before the card computes it), so verifying would silently drop
+        # all outgoing traffic. (Offline .pcap parsing keeps verification on.)
+        rec = parse_packet(data, ts, verify_checksum=False)
         if rec is not None:
             pipe.ring.put(rec)
 

@@ -22,6 +22,17 @@ def test_bad_checksum_returns_none():
     assert parsed.count(None) == 1   # exactly the corrupt frame
 
 
+def test_verify_checksum_flag_keeps_bad_frame_for_live_capture():
+    # Live capture passes verify_checksum=False because NIC checksum offload
+    # blanks outbound checksums; the fixture's one corrupt-checksum frame is then
+    # kept instead of dropped (only the checksum differs — the frame is well-formed).
+    raws = read_packets(FIXTURE)
+    strict = [parse_packet(r.data, r.timestamp) for r in raws]
+    lenient = [parse_packet(r.data, r.timestamp, verify_checksum=False) for r in raws]
+    assert strict.count(None) == 1            # corrupt frame discarded (offline default)
+    assert lenient.count(None) == 0           # ... but kept when checksums aren't verified
+
+
 def test_tcp_syn_fields():
     syn = parse_file(FIXTURE)[0]
     assert syn.protocol == PROTO_TCP
