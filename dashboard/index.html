@@ -158,7 +158,9 @@
 
 <script>
 "use strict";
-const API = "http://127.0.0.1:5000";
+// Served by the bridge (http://127.0.0.1:5000/) -> same-origin, relative API.
+// Opened straight from disk (file://) -> point at the bridge explicitly (CORS handles it).
+const API = location.protocol === "file:" ? "http://127.0.0.1:5000" : "";
 
 /* ---- Logger: no-op unless window.PQL_DEBUG ---- */
 const Logger = { debug(msg){ if (window.PQL_DEBUG) console.log("[PQL]", msg); } };

@@ -20,9 +20,10 @@ import threading
 import time
 from pathlib import Path
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+DASH_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(DASH_DIR.parent))
 from packetql.schema import int_to_ip  # noqa: E402
 from packetql.server import OK, QUERY, STATS, decode_result, recv_frame, send_frame  # noqa: E402
 
@@ -108,6 +109,16 @@ def _cors(resp):
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     return resp
+
+
+@app.get("/")
+def index():
+    return send_from_directory(DASH_DIR, "index.html")     # serve the dashboard itself
+
+
+@app.get("/favicon.ico")
+def favicon():
+    return ("", 204)
 
 
 @app.get("/api/stats")

@@ -43,8 +43,10 @@ python -m packetql.server --store data/demo_store      # or data/live_store
 python dashboard/bridge.py                             # http://127.0.0.1:5000
 ```
 
-**4 — open the dashboard:** double-click `dashboard/index.html` (opens as `file://`).
-The bridge sends permissive CORS headers so this works without a web server.
+**4 — open the dashboard:** browse to **http://127.0.0.1:5000/** — the bridge serves
+the dashboard itself (same-origin, no CORS needed). Or double-click
+`dashboard/index.html` to open it as `file://` (the bridge sends permissive CORS
+headers so that works too; the page auto-detects which mode it's in).
 
 > Tip: set `window.PQL_DEBUG = true` in the browser console to see polling logs.
 
