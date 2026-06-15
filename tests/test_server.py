@@ -1,74 +1,85 @@
-"""Tests for the TCP query server + thread pool (ephemeral localhost port)."""
+"""Phase 6 tests: binary wire protocol (incl. partial reads), QUERY/PING/STATS,
+the thread pool, and the readers-writer lock."""
 
+import os
 import socket
+import struct
 import threading
+import time
 
+from packetql.capture.pcap import read_packets
 from packetql.capture.pipeline import capture_offline
-from packetql.server import END_MARKER, QueryServer
-from tools.make_sample_pcap import build
+from packetql.server import (ERROR, OK, PING, QUERY, STATS, QueryServer, RWLock,
+                             decode_result, encode_result, recv_frame, send_frame)
+
+FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "sample.pcap")
 
 
-def _make_store(tmp_path) -> str:
-    pipe = capture_offline(build())
-    directory = str(tmp_path / "store")
-    pipe.flush_to_store(directory)
-    return directory
+def _store(tmp_path) -> str:
+    d = str(tmp_path / "s")
+    capture_offline(read_packets(FIXTURE), d)
+    return d
 
 
-def _read_until_end(rfile) -> str:
-    lines = []
-    for line in rfile:
-        if line.rstrip("\n") == END_MARKER:
-            break
-        lines.append(line.rstrip("\n"))
-    return "\n".join(lines)
+def test_frame_partial_read_reassembles():
+    a, b = socket.socketpair()
+    payload = b"SELECT 1"
+    raw = struct.pack("!IB", len(payload), QUERY) + payload
+
+    def sender():
+        a.sendall(raw[:3])          # split the frame across two sends
+        time.sleep(0.05)
+        a.sendall(raw[3:])
+
+    t = threading.Thread(target=sender)
+    t.start()
+    kind, got = recv_frame(b)
+    t.join()
+    assert kind == QUERY and got == payload
+    a.close()
+    b.close()
 
 
-def _client_query(port: int, sql: str) -> str:
-    with socket.create_connection(("127.0.0.1", port)) as sock:
-        rfile = sock.makefile("r", encoding="utf-8", newline="\n")
-        wfile = sock.makefile("w", encoding="utf-8", newline="\n")
-        _read_until_end(rfile)                 # banner
-        wfile.write(sql + "\n")
-        wfile.flush()
-        response = _read_until_end(rfile)
-        wfile.write("quit\n")
-        wfile.flush()
-        return response
+def test_encode_decode_result_roundtrip():
+    cols = ["dst_port", "ts", "size"]
+    rows = [(443, 1.5, 1500), (80, 2.0, 200)]
+    c, r = decode_result(encode_result(cols, rows))
+    assert c == cols and r == rows
 
 
-def test_server_runs_query_over_tcp(tmp_path):
-    server = QueryServer(_make_store(tmp_path), port=0, workers=2)
-    server.start()
+def _client(port, kind, payload=b""):
+    with socket.create_connection(("127.0.0.1", port)) as s:
+        send_frame(s, kind, payload)
+        return recv_frame(s)
+
+
+def test_query_ping_stats(tmp_path):
+    srv = QueryServer(_store(tmp_path), port=0, workers=2)
+    srv.start()
     try:
-        resp = _client_query(
-            server.port,
-            "SELECT dst_port FROM packets WHERE protocol = 'TCP' ORDER BY dst_port")
-        assert "443" in resp and "80" in resp
-        assert "rows)" in resp
+        assert _client(srv.port, PING) == (OK, b"pong")
+        status, payload = _client(srv.port, STATS)
+        assert status == OK and b"rows=5" in payload
+        status, payload = _client(srv.port, QUERY,
+                                  b"SELECT dst_port FROM packets WHERE proto = 6 ORDER BY dst_port")
+        assert status == OK
+        cols, rows = decode_result(payload)
+        assert cols == ["dst_port"] and [r[0] for r in rows] == [443, 443, 51000]
+        assert _client(srv.port, QUERY, b"SELECT nope FROM packets")[0] == ERROR
     finally:
-        server.stop()
+        srv.stop()
 
 
-def test_server_reports_query_errors(tmp_path):
-    server = QueryServer(_make_store(tmp_path), port=0, workers=2)
-    server.start()
-    try:
-        assert "Error:" in _client_query(server.port, "SELECT nope FROM packets")
-    finally:
-        server.stop()
-
-
-def test_thread_pool_handles_concurrent_clients(tmp_path):
-    server = QueryServer(_make_store(tmp_path), port=0, workers=4)
-    server.start()
-    results: list[str] = []
+def test_thread_pool_concurrent_clients(tmp_path):
+    srv = QueryServer(_store(tmp_path), port=0, workers=4)
+    srv.start()
+    results = []
     lock = threading.Lock()
 
     def hit():
-        resp = _client_query(server.port, "SELECT protocol FROM packets LIMIT 1")
+        status, _ = _client(srv.port, QUERY, b"SELECT size FROM packets LIMIT 1")
         with lock:
-            results.append(resp)
+            results.append(status)
 
     try:
         threads = [threading.Thread(target=hit) for _ in range(8)]
@@ -76,7 +87,33 @@ def test_thread_pool_handles_concurrent_clients(tmp_path):
             t.start()
         for t in threads:
             t.join()
-        assert len(results) == 8
-        assert all("rows)" in r for r in results)
+        assert results == [OK] * 8
     finally:
-        server.stop()
+        srv.stop()
+
+
+def test_rwlock_allows_concurrent_readers():
+    lock = RWLock()
+    lock.acquire_read()
+    lock.acquire_read()              # a second reader must not block
+    lock.release_read()
+    lock.release_read()
+
+
+def test_rwlock_writer_excludes_readers():
+    lock = RWLock()
+    lock.acquire_write()
+    got = []
+
+    def reader():
+        lock.acquire_read()
+        got.append(1)
+        lock.release_read()
+
+    t = threading.Thread(target=reader)
+    t.start()
+    t.join(timeout=0.2)
+    assert got == []                 # blocked while the writer holds the lock
+    lock.release_write()
+    t.join(timeout=1)
+    assert got == [1]                # proceeds once the writer releases

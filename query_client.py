@@ -1,9 +1,9 @@
-"""A tiny TCP client for the PacketQL query server (Phase 6).
+"""Binary-protocol client for the PacketQL query server.
 
     python query_client.py [host] [port]
 
-Type SQL at the prompt; results come back from the server. Blank line keeps
-going; 'quit' exits.
+Type SQL to run a query; '.ping' / '.stats' send those messages; 'quit' exits.
+IP/protocol/flag columns are rendered human-readably for display.
 """
 
 from __future__ import annotations
@@ -11,37 +11,66 @@ from __future__ import annotations
 import socket
 import sys
 
-END_MARKER = "[END]"
+from packetql.schema import flags_str, int_to_ip, proto_name
+from packetql.server import OK, PING, QUERY, STATS, decode_result, recv_frame, send_frame
+
+_IP_COLS = {"src_ip", "dst_ip"}
 
 
-def read_response(rfile) -> str:
-    lines = []
-    for line in rfile:
-        if line.rstrip("\n") == END_MARKER:
-            break
-        lines.append(line.rstrip("\n"))
-    return "\n".join(lines)
+def _fmt(col, value):
+    if col in _IP_COLS:
+        return int_to_ip(value)
+    if col == "proto":
+        return proto_name(value)
+    if col == "flags":
+        return flags_str(value)
+    return str(value)
+
+
+def format_table(columns, rows):
+    disp = [[_fmt(c, v) for c, v in zip(columns, r)] for r in rows]
+    widths = [len(c) for c in columns]
+    for r in disp:
+        for i, cell in enumerate(r):
+            widths[i] = max(widths[i], len(cell))
+    border = "+" + "+".join("-" * (w + 2) for w in widths) + "+"
+
+    def line(cells):
+        return "| " + " | ".join(c.ljust(widths[i]) for i, c in enumerate(cells)) + " |"
+
+    return "\n".join([border, line(list(columns)), border] + [line(r) for r in disp] + [border])
 
 
 def main() -> None:
     host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
     port = int(sys.argv[2]) if len(sys.argv) > 2 else 9999
     with socket.create_connection((host, port)) as sock:
-        rfile = sock.makefile("r", encoding="utf-8", newline="\n")
-        wfile = sock.makefile("w", encoding="utf-8", newline="\n")
-        print(read_response(rfile))      # banner
+        print(f"connected to {host}:{port}. Type SQL; '.ping', '.stats', or 'quit'.")
         while True:
             try:
-                sql = input("pktql> ").strip()
+                line = input("pktql> ").strip()
             except EOFError:
                 break
-            if not sql:
+            if not line:
                 continue
-            wfile.write(sql + "\n")
-            wfile.flush()
-            if sql.lower() in ("quit", "exit"):
+            if line.lower() in ("quit", "exit"):
                 break
-            print(read_response(rfile))
+            if line == ".ping":
+                send_frame(sock, PING)
+                print(recv_frame(sock)[1].decode())
+                continue
+            if line == ".stats":
+                send_frame(sock, STATS)
+                print(recv_frame(sock)[1].decode())
+                continue
+            send_frame(sock, QUERY, line.rstrip(";").encode())
+            status, payload = recv_frame(sock)
+            if status == OK:
+                cols, rows = decode_result(payload)
+                print(format_table(cols, rows))
+                print(f"({len(rows)} rows)")
+            else:
+                print("Error:", payload.decode())
 
 
 if __name__ == "__main__":

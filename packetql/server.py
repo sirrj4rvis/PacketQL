@@ -1,64 +1,172 @@
-"""Phase 6 — a TCP query server with a thread pool (the Networks + OS capstone).
+"""Phase 6 — a TCP query server with a binary wire protocol and a thread pool.
 
-Clients connect over TCP and send SQL queries, one per line; the server runs
-each against the columnar store and sends the rendered result back. Connections
-are handled by a **fixed pool of worker threads** pulling from a bounded queue:
-the accept loop is the producer, the workers are the consumers — the same
-producer/consumer shape as the capture ring buffer. A fixed pool bounds
-concurrency so a burst of clients can't spawn unbounded threads.
+Wire protocol (like PostgreSQL's, simplified):
+    request : [4-byte length][1-byte type][payload]   type 1=QUERY 2=PING 3=STATS
+    response: [4-byte length][1-byte status][payload]  status 0=OK 1=ERROR
+A QUERY's OK payload is the result encoded **column-major in binary** (column
+names + row count + per-column typed values). TCP gives no message boundaries,
+so every read loops until exactly ``length`` bytes have arrived (recv_exact).
 
-Wire protocol (line-oriented, telnet-friendly): the client sends one query line;
-the server replies with the rendered table followed by a lone ``[END]`` line as
-the response delimiter. ``quit`` (or EOF) closes the connection.
-
-Binding a localhost socket needs no special privileges — only live *capture*
-(Phase 5) needs Administrator. So the server runs over whatever store you point
-it at (e.g. the one you captured live).
+Concurrency: a fixed pool of worker threads pulls accepted connections from a
+bounded queue (accept loop = producer, workers = consumers). Each connection
+uses its own ColumnStore (no shared mutable state); the indexes are read-only and
+shared. A readers-writer lock guards index/store access so that — should a writer
+thread ever update them live — readers and the writer can't interleave.
 """
 
 from __future__ import annotations
 
 import queue
 import socket
+import struct
 import threading
 import time
+from contextlib import contextmanager
 
 from packetql.index.indexes import PacketIndexes
-from packetql.query.executor import QueryError, QueryResult, run_query
+from packetql.query.executor import QueryError, run_query
 from packetql.query.lexer import SQLSyntaxError
 from packetql.storage.columnar import ColumnStore
 
-END_MARKER = "[END]"
+# message types / statuses
+QUERY, PING, STATS = 1, 2, 3
+OK, ERROR = 0, 1
+_HEADER = struct.Struct("!IB")     # length, (type | status)
 
 
-def format_table(res: QueryResult) -> str:
-    rows = [["NULL" if v is None else str(v) for v in r] for r in res.rows]
-    widths = [len(c) for c in res.columns]
-    for r in rows:
-        for i, cell in enumerate(r):
-            widths[i] = max(widths[i], len(cell))
-    border = "+" + "+".join("-" * (w + 2) for w in widths) + "+"
+# ---------------------------------------------------------------------------
+# Wire protocol
+# ---------------------------------------------------------------------------
 
-    def line(cells):
-        return "| " + " | ".join(c.ljust(widths[i]) for i, c in enumerate(cells)) + " |"
 
-    return "\n".join([border, line(list(res.columns)), border] + [line(r) for r in rows] + [border])
+def recv_exact(sock: socket.socket, n: int) -> bytes:
+    """Read exactly n bytes, looping over partial recv()s (TCP has no framing)."""
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("peer closed the connection")
+        buf += chunk
+    return bytes(buf)
+
+
+def send_frame(sock: socket.socket, kind: int, payload: bytes = b"") -> None:
+    sock.sendall(_HEADER.pack(len(payload), kind) + payload)
+
+
+def recv_frame(sock: socket.socket) -> tuple[int, bytes]:
+    length, kind = _HEADER.unpack(recv_exact(sock, _HEADER.size))
+    return kind, recv_exact(sock, length)
+
+
+def encode_result(columns, rows) -> bytes:
+    """Column-major binary: names, row count, then each column's typed values."""
+    out = bytearray()
+    out.append(len(columns))
+    for name in columns:
+        nb = name.encode()
+        out.append(len(nb))
+        out += nb
+    out += struct.pack("!I", len(rows))
+    for j, name in enumerate(columns):
+        is_float = name == "ts"
+        out += b"f" if is_float else b"i"
+        s = struct.Struct("!d") if is_float else struct.Struct("!q")
+        for row in rows:
+            out += s.pack(row[j])
+    return bytes(out)
+
+
+def decode_result(payload: bytes):
+    pos = 0
+    ncols = payload[pos]; pos += 1
+    columns = []
+    for _ in range(ncols):
+        ln = payload[pos]; pos += 1
+        columns.append(payload[pos:pos + ln].decode()); pos += ln
+    (nrows,) = struct.unpack_from("!I", payload, pos); pos += 4
+    coldata = []
+    for _ in range(ncols):
+        typ = payload[pos:pos + 1]; pos += 1
+        s = struct.Struct("!d") if typ == b"f" else struct.Struct("!q")
+        vals = []
+        for _ in range(nrows):
+            vals.append(s.unpack_from(payload, pos)[0]); pos += s.size
+        coldata.append(vals)
+    rows = [tuple(coldata[j][i] for j in range(ncols)) for i in range(nrows)]
+    return columns, rows
+
+
+# ---------------------------------------------------------------------------
+# Readers-writer lock (writer-preferring) — a classic OS synchronization problem
+# ---------------------------------------------------------------------------
+
+
+class RWLock:
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._readers = 0
+        self._writer = False
+        self._writers_waiting = 0
+
+    def acquire_read(self) -> None:
+        with self._cond:
+            while self._writer or self._writers_waiting > 0:
+                self._cond.wait()
+            self._readers += 1
+
+    def release_read(self) -> None:
+        with self._cond:
+            self._readers -= 1
+            if self._readers == 0:
+                self._cond.notify_all()
+
+    def acquire_write(self) -> None:
+        with self._cond:
+            self._writers_waiting += 1
+            while self._writer or self._readers > 0:
+                self._cond.wait()
+            self._writers_waiting -= 1
+            self._writer = True
+
+    def release_write(self) -> None:
+        with self._cond:
+            self._writer = False
+            self._cond.notify_all()
+
+    @contextmanager
+    def read_locked(self):
+        self.acquire_read()
+        try:
+            yield
+        finally:
+            self.release_read()
+
+    @contextmanager
+    def write_locked(self):
+        self.acquire_write()
+        try:
+            yield
+        finally:
+            self.release_write()
+
+
+# ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
 
 
 class QueryServer:
-    """A thread-pool TCP server that answers SQL queries over a packet store."""
-
     def __init__(self, store_dir: str, host: str = "127.0.0.1", port: int = 9999,
                  workers: int = 4, backlog: int = 64) -> None:
         self.store_dir = store_dir
         self.num_workers = workers
-        # Build indexes once at startup; they are read-only and shared by all
-        # workers. Each connection opens its own ColumnStore, so there is no
-        # shared *mutable* state across threads.
         base = ColumnStore(store_dir)
         self.row_count = base.row_count
-        self.indexes = PacketIndexes.build(
-            base, hash_columns=["dst_port", "src_port"], trie_columns=["src_ip", "dst_ip"])
+        self.indexes = PacketIndexes.load_or_build(base)
+        self.lock = RWLock()
+        self._queries = 0
+        self._stats_lock = threading.Lock()
 
         self._queue: queue.Queue = queue.Queue(maxsize=backlog)
         self._workers: list[threading.Thread] = []
@@ -69,7 +177,6 @@ class QueryServer:
         self._sock.listen(backlog)
         self.host, self.port = self._sock.getsockname()
 
-    # -- lifecycle ----------------------------------------------------------
     def start(self) -> None:
         self._running = True
         for _ in range(self.num_workers):
@@ -81,17 +188,16 @@ class QueryServer:
     def stop(self) -> None:
         self._running = False
         try:
-            self._sock.close()           # unblocks the accept loop
+            self._sock.close()
         except OSError:
             pass
         for _ in self._workers:
-            self._queue.put(None)        # sentinel: wake each worker so it exits
+            self._queue.put(None)
 
     def serve_forever(self) -> None:
         self.start()
-        print(f"PacketQL query server listening on {self.host}:{self.port}  "
-              f"({self.num_workers} worker threads, {self.row_count} packets).")
-        print("Connect with:  python query_client.py        (Ctrl-C here to stop)")
+        print(f"PacketQL server on {self.host}:{self.port} "
+              f"({self.num_workers} workers, {self.row_count} packets). Ctrl-C to stop.")
         try:
             while True:
                 time.sleep(0.5)
@@ -100,13 +206,12 @@ class QueryServer:
         finally:
             self.stop()
 
-    # -- internals ----------------------------------------------------------
     def _accept_loop(self) -> None:
         while self._running:
             try:
                 conn, addr = self._sock.accept()
             except OSError:
-                break                    # socket closed by stop()
+                break
             self._queue.put((conn, addr))
 
     def _worker(self) -> None:
@@ -116,48 +221,53 @@ class QueryServer:
                 return
             conn, _addr = item
             try:
-                self._handle(conn)
-            except Exception:
-                pass                     # one bad connection never takes the worker down
+                self._serve(conn)
+            except (ConnectionError, OSError):
+                pass
             finally:
                 try:
                     conn.close()
                 except OSError:
                     pass
 
-    def _handle(self, conn: socket.socket) -> None:
-        store = ColumnStore(self.store_dir)   # per-connection: no shared mutable state
-        rfile = conn.makefile("r", encoding="utf-8", newline="\n")
-        wfile = conn.makefile("w", encoding="utf-8", newline="\n")
-        wfile.write(f"PacketQL query server - {store.row_count} packets. "
-                    f"Send SQL (one per line); 'quit' to exit.\n{END_MARKER}\n")
-        wfile.flush()
-        for raw in rfile:
-            sql = raw.strip().rstrip(";")
-            if not sql or sql.lower() in ("quit", "exit"):
-                break
+    def _serve(self, conn: socket.socket) -> None:
+        store = ColumnStore(self.store_dir)      # per-connection: no shared mutable store state
+        while True:
             try:
-                res = run_query(store, sql, indexes=self.indexes)
-                body = f"{format_table(res)}\n({len(res.rows)} rows)   plan: {res.plan}"
-            except (QueryError, SQLSyntaxError) as exc:
-                body = f"Error: {exc}"
-            wfile.write(f"{body}\n{END_MARKER}\n")
-            wfile.flush()
+                kind, payload = recv_frame(conn)
+            except ConnectionError:
+                return
+            if kind == PING:
+                send_frame(conn, OK, b"pong")
+            elif kind == STATS:
+                with self.lock.read_locked():
+                    info = f"rows={store.row_count} queries={self._queries} workers={self.num_workers}"
+                send_frame(conn, OK, info.encode())
+            elif kind == QUERY:
+                try:
+                    with self.lock.read_locked():
+                        result = run_query(store, payload.decode(), indexes=self.indexes)
+                    with self._stats_lock:
+                        self._queries += 1
+                    send_frame(conn, OK, encode_result(result.columns, result.rows))
+                except (QueryError, SQLSyntaxError) as exc:
+                    send_frame(conn, ERROR, str(exc).encode())
+            else:
+                send_frame(conn, ERROR, b"unknown message type")
 
 
 def main(argv=None) -> None:
     import argparse
     import os
 
-    parser = argparse.ArgumentParser(description="PacketQL TCP query server")
-    parser.add_argument("--store", default=os.path.join("data", "live_store"))
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=9999)
-    parser.add_argument("--workers", type=int, default=4)
-    args = parser.parse_args(argv)
+    p = argparse.ArgumentParser(description="PacketQL TCP query server")
+    p.add_argument("--store", default=os.path.join("data", "live_store"))
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=9999)
+    p.add_argument("--workers", type=int, default=4)
+    args = p.parse_args(argv)
     if not os.path.exists(os.path.join(args.store, "meta.json")):
-        print(f"No store at {args.store!r}. Capture first (demo_capture.py / capture_live) "
-              f"or pass --store <dir>.")
+        print(f"No store at {args.store!r}. Capture first, or pass --store <dir>.")
         return
     QueryServer(args.store, args.host, args.port, args.workers).serve_forever()
 
