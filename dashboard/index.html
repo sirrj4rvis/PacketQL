@@ -57,8 +57,8 @@
   .donut-shell{position:relative;flex:1 1 0;min-height:0}
   .donut-center{position:absolute;top:0;left:0;right:0;bottom:0;display:flex;
                 flex-direction:column;align-items:center;justify-content:center;pointer-events:none}
-  .donut-center .num{font-family:var(--mono);font-size:26px;color:#fff;font-weight:500}
-  .donut-center .cap{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px}
+  .donut-center .num{font-family:var(--mono);font-size:22px;color:#fff;font-weight:500;line-height:1}
+  .donut-center .cap{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;margin-top:3px}
   .legend{display:flex;flex-wrap:wrap;gap:12px;margin-top:12px;flex:0 0 auto}
   .legend .item{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--label)}
   .legend .sq{width:10px;height:10px;border-radius:2px}
@@ -257,8 +257,8 @@ function initCharts(){
   protoChart = new Chart($("protoChart"), {
     type:"doughnut",
     data:{ labels:[], datasets:[{ data:[], backgroundColor:[], borderColor:"#13161E", borderWidth:2 }] },
-    options:{ responsive:true, maintainAspectRatio:false, animation:false, cutout:"70%",
-      plugins:{ legend:{display:false}, tooltip:{enabled:true} } }
+    options:{ responsive:true, maintainAspectRatio:false, animation:false, cutout:"72%",
+      plugins:{ legend:{display:false}, tooltip:{enabled:false} } }
   });
   portChart = new Chart($("portChart"), {
     type:"bar",
@@ -323,8 +323,8 @@ function renderProtocol(d){
     const pct = total ? (data[i]/total*100).toFixed(1) : "0.0";
     const item = document.createElement("div"); item.className = "item";
     const sq = document.createElement("span"); sq.className = "sq"; sq.style.background = colors[i];
-    const txt = document.createElement("span"); txt.textContent = name + " ";
-    const p = document.createElement("span"); p.className = "pct"; p.textContent = pct + "%";
+    const txt = document.createElement("span"); txt.textContent = name;
+    const p = document.createElement("span"); p.className = "pct"; p.textContent = fmtInt(data[i]) + " · " + pct + "%";
     item.appendChild(sq); item.appendChild(txt); item.appendChild(p); leg.appendChild(item);
   });
 }
