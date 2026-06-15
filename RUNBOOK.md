@@ -149,6 +149,24 @@ quit
 **Expect:** `.ping` → `pong`; `.stats` → `rows=5 …`; the query returns a table.
 Stop the server in Terminal A with **Ctrl-C**.
 
+### Notes & gotchas
+
+- **Two separate terminals** — the server blocks its terminal, so run the client in another one.
+- **Don't delete or rebuild the store a running server is serving.** If you do (e.g. running
+  Step 5's `Remove-Item data\live_store` against a server started on `data/live_store`),
+  `SELECT`/`.stats` return `Error: store unavailable: …`. **Fix:** restart the server against a
+  store that exists. *(A `.ping` still works — it needs no store.)*
+- **`WinError 10053 / 10054` (connection aborted/reset) in the client** means exactly that — the
+  server's store went missing. Restart the server on a valid store.
+- **Port 9999 already in use, or a stale server lingering?** Kill whatever holds the port, then restart:
+
+  ```powershell
+  Get-NetTCPConnection -LocalPort 9999 -State Listen -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }
+  ```
+
+- Serve your **live** capture instead of the demo store — point `--store` at it *after* capturing:
+  `python -m packetql.server --store data/live_store`
+
 ---
 
 ## 5 · Live capture  (⚠ Administrator + scapy/Npcap)
