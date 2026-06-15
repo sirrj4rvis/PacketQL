@@ -1,20 +1,25 @@
-"""Smoke tests for the benchmark suite: it runs and produces sane numbers.
+"""Smoke tests for the benchmark suite: it runs and the qualitative results hold.
+No machine-specific timings are asserted."""
 
-Deliberately does NOT assert machine-specific timings (those vary run to run);
-only structural facts that must always hold.
-"""
-
-from benchmarks.benchmark_suite import run_benchmarks
+from benchmarks.benchmark_suite import (columnar_vs_rowstore, concurrency,
+                                        scan_vs_index, write_throughput)
 
 
-def test_benchmark_suite_runs():
-    r = run_benchmarks(n=2000, reps=2, write_report=False, quiet=True)
-    assert r["captured"] == 2000
-    assert r["dropped"] == 0
-    assert r["cap_throughput"] > 0
-    assert r["matches_eq"] > 0          # some packets are dst_port 443
+def test_scan_vs_index_runs():
+    n, scan_ms, idx_ms, matches = scan_vs_index([2000])[0]
+    assert n == 2000 and scan_ms > 0 and idx_ms >= 0 and matches > 0
 
 
-def test_selective_read_is_a_fraction_of_the_store():
-    r = run_benchmarks(n=2000, reps=2, write_report=False, quiet=True)
-    assert 0 < r["sel_bytes"] < r["total_bytes"]
+def test_columnar_reads_less_than_rowstore():
+    _n, _col_ms, _row_ms, col_bytes, row_bytes = columnar_vs_rowstore(5000)
+    assert col_bytes < row_bytes        # one column vs a full row store
+
+
+def test_larger_write_batch_is_faster():
+    res = dict((bs, pps) for bs, pps, _mbs in write_throughput(500, [1, 500]))
+    assert res[500] > res[1]            # fewer fsyncs -> higher throughput
+
+
+def test_concurrency_runs():
+    res = concurrency(500, [1, 2], duration=0.1)
+    assert all(qps > 0 for _c, qps in res)
